@@ -84,6 +84,8 @@ impl Inputs {
                     let line = line.as_str().trim();
 
                     if line.is_empty() {
+                        write!(stdout, "\n{}λ ", termion::cursor::Goto(1, y + 1))?;
+                        stdout.flush()?;
                         continue;
                     }
 
