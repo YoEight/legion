@@ -8,3 +8,7 @@ edition = "2018"
 
 [dependencies]
 rlua = "0.17.0"
+structopt = "0.3"
+eventstore = "0.9.4"
+tokio = { version = "0.2", features = ["macros"] }
+termion = "1.5.5"
