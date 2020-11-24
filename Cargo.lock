@@ -586,6 +586,7 @@ version = "0.1.0"
 dependencies = [
  "eventstore",
  "rlua",
+ "serde_json",
  "structopt",
  "termion",
  "tokio",
