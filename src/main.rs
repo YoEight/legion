@@ -2,13 +2,13 @@ mod input;
 
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
 use input::Input;
+use rlua::{prelude::LuaValue, Lua, TablePairs};
+use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use structopt::StructOpt;
 use termion::cursor::DetectCursorPos;
 use termion::raw::IntoRawMode;
-use rlua::{ Lua, TablePairs, prelude::LuaValue };
-use std::collections::HashMap;
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -20,8 +20,14 @@ fn parse_connection_string(input: &str) -> Result<ClientSettings, ClientSettings
     ClientSettings::parse_str(input)
 }
 
-fn collect_expr_value(mut value: LuaValue) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut stack = Vec::<(HashMap<String, serde_json::Value>, String, TablePairs<String, LuaValue>)>::new();
+fn collect_expr_value(
+    mut value: LuaValue,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut stack = Vec::<(
+        HashMap<String, serde_json::Value>,
+        String,
+        TablePairs<String, LuaValue>,
+    )>::new();
 
     loop {
         if let Some((mut obj, key, mut pairs)) = stack.pop() {
@@ -70,7 +76,7 @@ fn collect_expr_value(mut value: LuaValue) -> Result<Option<serde_json::Value>, 
                     obj.insert(key, child_value);
                 }
 
-                _ => {},
+                _ => {}
             }
 
             if let Some((key, next)) = pairs.next().transpose()? {
@@ -85,23 +91,23 @@ fn collect_expr_value(mut value: LuaValue) -> Result<Option<serde_json::Value>, 
             if let Some((mut parent, parent_key, mut parent_pairs)) = stack.pop() {
                 let parent_value = serde_json::to_value(obj)?;
                 parent.insert(parent_key, parent_value);
-            
+
                 if let Some((key, next)) = parent_pairs.next().transpose()? {
                     // has_remaining_keys = true;
                     value = next;
                     stack.push((parent, key, parent_pairs));
                     continue;
                 }
-                
+
                 obj = parent;
             }
 
             /* if has_remaining_keys { */
-                // continue;
+            // continue;
             /* } */
 
             let value = serde_json::to_value(obj)?;
-            
+
             return Ok(Some(value));
         } else {
             match value {
@@ -161,13 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
     // let _client = Client::create(params.conn_setts).await?;
-    let mut stdout = io::stdout().into_raw_mode().unwrap();
-    let mut lua = Lua::new();
+    let mut stdout = io::stdout();
+    let lua = Lua::new();
 
     lua.context::<_, rlua::Result<()>>(|context| {
-        let streams_fn = context.create_function(|_, _: ()| {
-            Ok(vec!["foo", "bar", "baz"])
-        })?;
+        let streams_fn = context.create_function(|_, _: ()| Ok(vec!["foo", "bar", "baz"]))?;
 
         context.globals().set("streams", streams_fn)?;
 
@@ -176,22 +180,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let input = inputs.await_input(&mut stdout)?;
-        let (_, y) = stdout.cursor_pos()?;
 
         match input {
             Input::Exit => {
-                write!(stdout, "\n{}", termion::cursor::Goto(1, y + 1))?;
+                println!();
                 break;
             }
 
             Input::String(line) => {
-                let result = lua.context::<_, Result<Option<serde_json::Value>, Box<dyn std::error::Error>>>(move |context| {
-                    let value = context.load(line.as_str()).eval()?;
-                    collect_expr_value(value)
-                })?;
+                let result = lua
+                    .context::<_, Result<Option<serde_json::Value>, Box<dyn std::error::Error>>>(
+                        move |context| {
+                            let value = context.load(line.as_str()).eval()?;
+                            collect_expr_value(value)
+                        },
+                    );
 
-                if let Some(result) = result.as_ref() {
-                    write!(stdout, "\n{}>>> {}", termion::cursor::Goto(1, y + 1), serde_json::to_string_pretty(result)?)?;
+                match result {
+                    Ok(result) => {
+                        if let Some(result) = result.as_ref() {
+                            println!("\n>>>\n{}", serde_json::to_string_pretty(result)?);
+                        }
+                    }
+
+                    Err(e) => {
+                        println!("\n{}", e);
+                    }
                 }
             }
 

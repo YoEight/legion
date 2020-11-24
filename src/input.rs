@@ -2,6 +2,7 @@ use std::io::{self, Stdin, Stdout, Write};
 use termion::cursor::DetectCursorPos;
 use termion::event::Key;
 use termion::input::{Keys, TermRead};
+use termion::raw::IntoRawMode;
 
 pub enum Input {
     String(String),
@@ -29,6 +30,8 @@ impl Inputs {
     }
 
     pub fn await_input(&mut self, stdout: &mut Stdout) -> io::Result<Input> {
+        let mut stdout = stdout.into_raw_mode()?;
+
         let (_, y) = stdout.cursor_pos()?;
         write!(stdout, "\n{}λ ", termion::cursor::Goto(1, y + 1))?;
         stdout.flush()?;
