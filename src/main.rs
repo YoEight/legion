@@ -9,6 +9,7 @@ use std::io::Write;
 use structopt::StructOpt;
 use termion::cursor::DetectCursorPos;
 use termion::raw::IntoRawMode;
+use futures::{ TryStreamExt, StreamExt };
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -162,16 +163,51 @@ fn collect_expr_value(
     Ok(None)
 }
 
+async fn list_streams_impl(client: &eventstore::Client) -> rlua::Result<Vec<String>> {
+    let result = client.read_stream("$streams")
+        .start_from_beginning()
+        .resolve_link_tos(eventstore::LinkTos::NoResolution)
+        .read_through()
+        .await;
+
+    match result {
+        Ok(result) => {
+            match result {
+                eventstore::ReadResult::Ok(result) => {
+                    result
+                        .map_ok(|event| {
+                            let payload = event.get_original_event().data.clone();
+                            let value = std::str::from_utf8(payload.as_ref()).unwrap().to_owned();
+                 
+                            value
+                        }).try_collect::<Vec<String>>().await.map_err(|e| rlua::Error::RuntimeError(e.to_string()))
+                }
+
+                eventstore::ReadResult::StreamNotFound(_) => Err(rlua::Error::RuntimeError("$streams stream not found".to_string())),
+            }
+        }
+
+        Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
-    // let _client = Client::create(params.conn_setts).await?;
+    let client = Client::create(params.conn_setts).await?;
     let mut stdout = io::stdout();
     let lua = Lua::new();
 
-    lua.context::<_, rlua::Result<()>>(|context| {
-        let streams_fn = context.create_function(|_, _: ()| Ok(vec!["foo", "bar", "baz"]))?;
+    let client_inner = client.clone();
+
+    lua.context::<_, rlua::Result<()>>(move |context| {
+        let streams_fn = context.create_function(move |_, _: ()| {
+            match futures::executor::block_on(list_streams_impl(&client_inner)) {
+                Ok(stream_names) => Ok(stream_names),
+                Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+            }
+        })?;
 
         context.globals().set("streams", streams_fn)?;
 
