@@ -1,6 +1,7 @@
 mod input;
 
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
+use futures::{StreamExt, TryStreamExt};
 use input::Input;
 use rlua::{prelude::LuaValue, Lua, TablePairs};
 use std::collections::HashMap;
@@ -162,16 +163,59 @@ fn collect_expr_value(
     Ok(None)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn list_streams_impl(client: &eventstore::Client) -> rlua::Result<Vec<String>> {
+    let result = client
+        .read_stream("$streams")
+        .start_from_beginning()
+        .resolve_link_tos(eventstore::LinkTos::NoResolution)
+        .read_through()
+        .await;
+
+    match result {
+        Ok(result) => match result {
+            eventstore::ReadResult::Ok(result) => result
+                .map_ok(|event| {
+                    let payload = event.get_original_event().data.clone();
+                    let value = std::str::from_utf8(payload.as_ref()).unwrap().to_owned();
+                    let value = value
+                        .as_str()
+                        .split("@")
+                        .collect::<Vec<&str>>()
+                        .last()
+                        .unwrap()
+                        .to_string();
+
+                    value
+                })
+                .try_collect::<Vec<String>>()
+                .await
+                .map_err(|e| rlua::Error::RuntimeError(e.to_string())),
+
+            eventstore::ReadResult::StreamNotFound(_) => Err(rlua::Error::RuntimeError(
+                "$streams stream not found".to_string(),
+            )),
+        },
+
+        Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
-    // let _client = Client::create(params.conn_setts).await?;
+    let mut runtime = tokio::runtime::Runtime::new()?;
+    let client = runtime.block_on(Client::create(params.conn_setts))?;
     let mut stdout = io::stdout();
     let lua = Lua::new();
 
-    lua.context::<_, rlua::Result<()>>(|context| {
-        let streams_fn = context.create_function(|_, _: ()| Ok(vec!["foo", "bar", "baz"]))?;
+    let lended = client.clone();
+    lua.context::<_, rlua::Result<()>>(move |context| {
+        let streams_fn = context.create_function_mut(move |_, _: ()| {
+            match runtime.block_on(list_streams_impl(&lended)) {
+                Ok(stream_names) => Ok(stream_names),
+                Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+            }
+        })?;
 
         context.globals().set("streams", streams_fn)?;
 
