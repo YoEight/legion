@@ -191,19 +191,17 @@ async fn list_streams_impl(client: &eventstore::Client) -> rlua::Result<Vec<Stri
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
-    let client = Client::create(params.conn_setts).await?;
+    let mut runtime = tokio::runtime::Runtime::new()?;
+    let client = runtime.block_on(Client::create(params.conn_setts))?;
     let mut stdout = io::stdout();
     let lua = Lua::new();
 
-    let client_inner = client.clone();
-
     lua.context::<_, rlua::Result<()>>(move |context| {
-        let streams_fn = context.create_function(move |_, _: ()| {
-            match futures::executor::block_on(list_streams_impl(&client_inner)) {
+        let streams_fn = context.create_function_mut(move |_, _: ()| {
+            match runtime.block_on(list_streams_impl(&client)) {
                 Ok(stream_names) => Ok(stream_names),
                 Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
             }
