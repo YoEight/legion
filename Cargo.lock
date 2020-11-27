@@ -587,6 +587,8 @@ dependencies = [
  "eventstore",
  "futures",
  "rlua",
+ "rlua_serde",
+ "serde",
  "serde_json",
  "structopt",
  "termion",
@@ -1069,6 +1071,16 @@ dependencies = [
  "cc",
  "libc",
  "num-traits",
+]
+
+[[package]]
+name = "rlua_serde"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e57c8c7bfcc5f18a46ddaf0c6a0d6a5c083ce9e6d185d4093bf98e640d256b"
+dependencies = [
+ "rlua",
+ "serde",
 ]
 
 [[package]]

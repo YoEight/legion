@@ -1,15 +1,30 @@
 mod input;
 
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use input::Input;
 use rlua::{prelude::LuaValue, Lua, TablePairs};
+use serde::{
+    de::{SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
-use std::io::Write;
 use structopt::StructOpt;
-use termion::cursor::DetectCursorPos;
-use termion::raw::IntoRawMode;
+
+/* macro_rules! tri { */
+// ($e:expr) => {
+//     match $e {
+//         serde_json::error::Result::Ok(val) => val,
+//         serde_json::error::Result::Err(err) => return serde_json::error::Result::Err(err),
+//     }
+// };
+// ($e:expr,) => {
+//     tri!($e)
+/* }; */
+// }
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -17,150 +32,130 @@ struct Params {
     conn_setts: ClientSettings,
 }
 
-fn parse_connection_string(input: &str) -> Result<ClientSettings, ClientSettingsParseError> {
-    ClientSettings::parse_str(input)
-}
+struct ValueVisitor;
 
-fn collect_expr_value(
-    mut value: LuaValue,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut stack = Vec::<(
-        HashMap<String, serde_json::Value>,
-        String,
-        TablePairs<String, LuaValue>,
-    )>::new();
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
 
-    loop {
-        if let Some((mut obj, key, mut pairs)) = stack.pop() {
-            match value {
-                LuaValue::Boolean(bool) => {
-                    let child_value = serde_json::to_value(bool)?;
-
-                    obj.insert(key, child_value);
-                }
-
-                LuaValue::Integer(i) => {
-                    let child_value = serde_json::to_value(i)?;
-
-                    obj.insert(key, child_value);
-                }
-
-                LuaValue::Number(n) => {
-                    let child_value = serde_json::to_value(n)?;
-
-                    obj.insert(key, child_value);
-                }
-
-                LuaValue::String(s) => {
-                    let child_value = serde_json::to_value(s.to_str()?)?;
-
-                    obj.insert(key, child_value);
-                }
-
-                LuaValue::Error(e) => {
-                    return Err(e.into());
-                }
-
-                LuaValue::Table(table) => {
-                    let child = std::collections::HashMap::<String, serde_json::Value>::new();
-                    let mut child_pairs = table.pairs::<String, LuaValue>();
-
-                    if let Some((child_key, next)) = child_pairs.next().transpose()? {
-                        value = next;
-                        stack.push((obj, key, pairs));
-                        stack.push((child, child_key, child_pairs));
-                        continue;
-                    }
-
-                    let child_value = serde_json::to_value(child)?;
-
-                    obj.insert(key, child_value);
-                }
-
-                _ => {}
-            }
-
-            if let Some((key, next)) = pairs.next().transpose()? {
-                value = next;
-                stack.push((obj, key, pairs));
-                continue;
-            }
-
-            // let mut has_remaining_keys = false;
-            // TODO - This needs to be done recursively.
-            // The use case being when dealing with multiple level of inner objects.
-            if let Some((mut parent, parent_key, mut parent_pairs)) = stack.pop() {
-                let parent_value = serde_json::to_value(obj)?;
-                parent.insert(parent_key, parent_value);
-
-                if let Some((key, next)) = parent_pairs.next().transpose()? {
-                    // has_remaining_keys = true;
-                    value = next;
-                    stack.push((parent, key, parent_pairs));
-                    continue;
-                }
-
-                obj = parent;
-            }
-
-            /* if has_remaining_keys { */
-            // continue;
-            /* } */
-
-            let value = serde_json::to_value(obj)?;
-
-            return Ok(Some(value));
-        } else {
-            match value {
-                LuaValue::Boolean(bool) => {
-                    let value = serde_json::to_value(bool)?;
-
-                    return Ok(Some(value));
-                }
-
-                LuaValue::Integer(i) => {
-                    let value = serde_json::to_value(i)?;
-
-                    return Ok(Some(value));
-                }
-
-                LuaValue::Number(n) => {
-                    let value = serde_json::to_value(n)?;
-
-                    return Ok(Some(value));
-                }
-
-                LuaValue::String(s) => {
-                    let value = serde_json::to_value(s.to_str()?)?;
-
-                    return Ok(Some(value));
-                }
-
-                LuaValue::Error(e) => {
-                    return Err(e.into());
-                }
-
-                LuaValue::Table(table) => {
-                    let obj = std::collections::HashMap::<String, serde_json::Value>::new();
-                    let mut pairs = table.pairs::<String, LuaValue>();
-
-                    if let Some((key, next)) = pairs.next().transpose()? {
-                        value = next;
-                        stack.push((obj, key, pairs));
-                        continue;
-                    }
-
-                    let value = serde_json::to_value(obj)?;
-
-                    return Ok(Some(value));
-                }
-
-                _ => break,
-            }
-        }
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any valid JSON value")
     }
 
-    Ok(None)
+    #[inline]
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    #[inline]
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    #[inline]
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    #[inline]
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[inline]
+    fn visit_str<E>(self, value: &str) -> Result<Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(String::from(value))
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[inline]
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    #[inline]
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    #[inline]
+    fn visit_some<D>(self, deserializer: D) -> Result<Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Deserialize::deserialize(deserializer)
+    }
+
+    #[inline]
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    #[inline]
+    fn visit_seq<V>(self, mut visitor: V) -> Result<Value, V::Error>
+    where
+        V: SeqAccess<'de>,
+    {
+        let mut vec = Vec::new();
+
+        while let Some(elem) = visitor.next_element()? {
+            vec.push(elem);
+        }
+
+        Ok(Value::Array(vec))
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    fn visit_map<V>(self, mut visitor: V) -> Result<Value, V::Error>
+    where
+        V: MapAccess<'de>,
+    {
+        match visitor.next_key_seed(KeyClassifier)? {
+            #[cfg(feature = "arbitrary_precision")]
+            Some(KeyClass::Number) => {
+                let number: NumberFromString = visitor.next_value()?;
+                Ok(Value::Number(number.value))
+            }
+            #[cfg(feature = "raw_value")]
+            Some(KeyClass::RawValue) => {
+                let value = visitor.next_value_seed(crate::raw::BoxedFromString)?;
+                crate::from_str(value.get()).map_err(de::Error::custom)
+            }
+            Some(KeyClass::Map(first_key)) => {
+                let mut values = Map::new();
+
+                values.insert(first_key, tri!(visitor.next_value()));
+                while let Some((key, value)) = tri!(visitor.next_entry()) {
+                    values.insert(key, value);
+                }
+
+                Ok(Value::Object(values))
+            }
+            None => Ok(Value::Object(Map::new())),
+        }
+    }
+}
+
+struct REPLValue {
+    value: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for REPLValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserializer.deserialize_seq(ValueVisitor)?;
+
+        Ok(REPLValue { value })
+    }
+}
+
+fn parse_connection_string(input: &str) -> Result<ClientSettings, ClientSettingsParseError> {
+    ClientSettings::parse_str(input)
 }
 
 async fn list_streams_impl(client: &eventstore::Client) -> rlua::Result<Vec<String>> {
@@ -210,9 +205,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lended = client.clone();
     lua.context::<_, rlua::Result<()>>(move |context| {
-        let streams_fn = context.create_function_mut(move |_, _: ()| {
+        let streams_fn = context.create_function_mut(move |ctx, _: ()| {
             match runtime.block_on(list_streams_impl(&lended)) {
-                Ok(stream_names) => Ok(stream_names),
+                Ok(stream_names) => rlua_serde::to_value(ctx, stream_names),
                 Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
             }
         })?;
@@ -232,19 +227,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Input::String(line) => {
-                let result = lua
-                    .context::<_, Result<Option<serde_json::Value>, Box<dyn std::error::Error>>>(
-                        move |context| {
-                            let value = context.load(line.as_str()).eval()?;
-                            collect_expr_value(value)
-                        },
-                    );
+                let result =
+                    lua.context::<_, Result<REPLValue, rlua_serde::error::Error>>(move |context| {
+                        let value = context.load(line.as_str()).eval()?;
+                        REPLValue::deserialize(rlua_serde::de::Deserializer { value })
+                    });
 
                 match result {
                     Ok(result) => {
-                        if let Some(result) = result.as_ref() {
-                            println!("\n>>>\n{}", serde_json::to_string_pretty(result)?);
-                        }
+                        println!("\n>>>\n{}", serde_json::to_string_pretty(&result.value)?);
                     }
 
                     Err(e) => {
