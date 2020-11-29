@@ -112,7 +112,7 @@ impl Inputs {
                 Key::Char(c) => {
                     self.offset += 1;
 
-                    if self.offset < self.buffer.len() as u16 {
+                    if self.offset < (self.buffer.len() + 1) as u16 {
                         self.buffer.insert((self.offset as usize) - 1, c);
                         write!(
                             stdout,
