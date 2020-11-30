@@ -1,4 +1,5 @@
 mod conversion;
+mod history;
 mod input;
 mod lua_impl;
 
@@ -22,10 +23,8 @@ fn parse_connection_string(input: &str) -> Result<ClientSettings, ClientSettings
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    pretty_env_logger::init();
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
-    // let mut runtime = tokio::runtime::Runtime::new()?;
     let client = Client::create(params.conn_setts).await?;
     let mut stdout = io::stdout();
     let lua = Lua::new();

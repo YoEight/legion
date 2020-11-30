@@ -1,3 +1,4 @@
+use crate::history::History;
 use std::io::{self, Stdin, Stdout, Write};
 use termion::cursor::DetectCursorPos;
 use termion::event::Key;
@@ -15,6 +16,7 @@ pub struct Inputs {
     offset: u16,
     start_pos: u16,
     keys: Keys<Stdin>,
+    history: History,
 }
 
 impl Inputs {
@@ -26,6 +28,7 @@ impl Inputs {
             buffer: String::new(),
             offset: 0,
             start_pos: 3,
+            history: History::new(),
         }
     }
 
@@ -82,6 +85,34 @@ impl Inputs {
                     )?;
                 }
 
+                Key::Up => {
+                    if let Some(entry) = self.history.prev_entry() {
+                        self.offset = entry.len() as u16;
+                        self.buffer = entry;
+                        write!(
+                            stdout,
+                            "{}{}λ {}",
+                            termion::cursor::Goto(1, y),
+                            termion::clear::CurrentLine,
+                            self.buffer
+                        )?;
+                    }
+                }
+
+                Key::Down => {
+                    if let Some(entry) = self.history.next_entry() {
+                        self.offset = entry.len() as u16;
+                        self.buffer = entry;
+                        write!(
+                            stdout,
+                            "{}{}λ {}",
+                            termion::cursor::Goto(1, y),
+                            termion::clear::CurrentLine,
+                            self.buffer
+                        )?;
+                    }
+                }
+
                 Key::Char('\n') => {
                     let line = std::mem::replace(&mut self.buffer, String::new());
                     let line = line.as_str().trim();
@@ -92,6 +123,7 @@ impl Inputs {
                         continue;
                     }
 
+                    self.history.push(line.to_string());
                     self.offset = 0;
 
                     if let Some(cmd) = line.strip_prefix(":") {
