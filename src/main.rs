@@ -11,25 +11,31 @@ use std::io;
 use structopt::StructOpt;
 use tokio::task::block_in_place;
 
+type Result<A> = std::result::Result<A, Box<dyn std::error::Error>>;
+
 #[derive(StructOpt, Debug)]
 struct Params {
     #[structopt(short = "c",  long = "connection-string", default_value = "esdb://localhost:2113", parse(try_from_str = parse_connection_string))]
     conn_setts: ClientSettings,
 }
 
-fn parse_connection_string(input: &str) -> Result<ClientSettings, ClientSettingsParseError> {
+fn parse_connection_string(
+    input: &str,
+) -> std::result::Result<ClientSettings, ClientSettingsParseError> {
     ClientSettings::parse_str(input)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> crate::Result<()> {
+    pretty_env_logger::init();
     let params = Params::from_args();
     let mut inputs = crate::input::Inputs::new();
-    let client = Client::create(params.conn_setts).await?;
+    let client = Client::create(params.conn_setts.clone()).await?;
     let mut stdout = io::stdout();
     let lua = Lua::new();
 
     lua.context::<_, rlua::Result<()>>(move |context| {
+        let http_client = reqwest::Client::new();
         let inner_client = client.clone();
         let streams_fn = context.create_function_mut(move |ctx, _: ()| {
             block_in_place(|| {
@@ -53,8 +59,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         })?;
 
+        let server_version = context.create_function_mut(move |ctx, _: ()| {
+            block_in_place(|| {
+                match futures::executor::block_on(lua_impl::server_version_impl(
+                    &http_client,
+                    &params.conn_setts,
+                )) {
+                    Ok(version) => rlua_serde::to_value(ctx, version),
+                    Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+                }
+            })
+        })?;
+
         context.globals().set("streams", streams_fn)?;
         context.globals().set("stream_events", stream_events)?;
+        context.globals().set("server_version", server_version)?;
 
         Ok(())
     })?;
@@ -69,20 +88,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Input::String(line) => {
-                let result = lua.context::<_, Result<serde_json::Value, rlua_serde::error::Error>>(
-                    move |context| {
-                        let value = context.load(line.as_str()).eval()?;
-                        deserialize_repl_value(value)
-                    },
-                );
+                let result = lua
+                    .context::<_, std::result::Result<String, rlua_serde::error::Error>>(
+                        move |context| {
+                            let value = context.load(line.as_str()).eval()?;
+                            deserialize_repl_value(value)
+                        },
+                    );
 
                 match result {
-                    Ok(value) => {
-                        println!("\n>>>\n{}", serde_json::to_string_pretty(&value)?);
+                    Ok(s) => {
+                        println!("\n>>>\n{}", s);
                     }
 
                     Err(e) => {
-                        println!("\n{}", e);
+                        println!("\nERR: {}", e);
                     }
                 }
             }

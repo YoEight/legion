@@ -112,23 +112,29 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 }
 
-struct REPLValue {
-    value: serde_json::Value,
-}
+pub fn deserialize_repl_value(value: rlua::Value) -> Result<String, rlua_serde::error::Error> {
+    match value {
+        rlua::Value::String(s) => Ok(s.to_str()?.to_string()),
+        rlua::Value::Integer(i) => Ok(i.to_string()),
+        rlua::Value::Boolean(b) => Ok(b.to_string()),
+        value => {
+            let value = rlua_serde::de::Deserializer {
+                value: value.clone(),
+            }
+            .deserialize_seq(ValueVisitor)
+            .or_else(|_| {
+                rlua_serde::de::Deserializer {
+                    value: value.clone(),
+                }
+                .deserialize_map(ValueVisitor)
+            })?;
 
-impl<'de> Deserialize<'de> for REPLValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = deserializer.deserialize_seq(ValueVisitor)?;
-
-        Ok(REPLValue { value })
+            match serde_json::to_string_pretty(&value) {
+                Ok(s) => Ok(s),
+                Err(e) => Err(rlua_serde::error::Error::from(rlua::Error::RuntimeError(
+                    e.to_string(),
+                ))),
+            }
+        }
     }
-}
-
-pub fn deserialize_repl_value(
-    value: rlua::Value,
-) -> Result<serde_json::Value, rlua_serde::error::Error> {
-    REPLValue::deserialize(rlua_serde::de::Deserializer { value }).map(|v| v.value)
 }

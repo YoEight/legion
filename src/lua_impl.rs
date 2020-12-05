@@ -1,4 +1,5 @@
 use futures::TryStreamExt;
+use serde::Deserialize;
 
 pub async fn list_streams_impl(client: &eventstore::Client) -> rlua::Result<Vec<String>> {
     let result = client
@@ -113,4 +114,44 @@ pub async fn list_stream_events_impl(
 
         Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
     }
+}
+
+#[derive(Deserialize, Debug)]
+struct NodeInfo {
+    #[serde(rename = "esVersion")]
+    version: String,
+}
+
+fn create_url(setts: &eventstore::ClientSettings) -> crate::Result<reqwest::Url> {
+    let scheme = if setts.is_secure_mode_enabled() {
+        "https"
+    } else {
+        "http"
+    };
+
+    let endpoint = setts
+        .hosts()
+        .get(0)
+        .expect("eventstore lib already checked it!");
+
+    let url = reqwest::Url::parse(
+        format!("{}://{}:{}/info", scheme, endpoint.host, endpoint.port).as_str(),
+    )?;
+
+    Ok(url)
+}
+
+pub async fn server_version_impl(
+    client: &reqwest::Client,
+    setts: &eventstore::ClientSettings,
+) -> crate::Result<String> {
+    let node_info = client
+        .get(create_url(&setts)?)
+        .header("content-type", "application/json")
+        .send()
+        .await?
+        .json::<NodeInfo>()
+        .await?;
+
+    Ok(node_info.version)
 }
