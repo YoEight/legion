@@ -7,8 +7,13 @@ use termion::raw::IntoRawMode;
 
 pub enum Input {
     String(String),
-    Command(String),
+    Command(Command),
     Exit,
+    Error(String),
+}
+
+pub enum Command {
+    Load(std::path::PathBuf),
 }
 
 pub struct Inputs {
@@ -127,15 +132,27 @@ impl Inputs {
                     self.offset = 0;
 
                     if let Some(cmd) = line.strip_prefix(":") {
-                        if cmd == "exit" {
-                            return Ok(Input::Exit);
-                        }
-
                         if cmd.is_empty() {
                             continue;
                         }
 
-                        return Ok(Input::Command(cmd.to_string()));
+                        let mut params = cmd.split(" ").collect::<Vec<&str>>();
+
+                        match params.remove(0) {
+                            "exit" => return Ok(Input::Exit),
+                            "load" => {
+                                let path = params.join(" ");
+                                let path = std::path::Path::new(&path);
+
+                                match path.canonicalize() {
+                                    Ok(path) => return Ok(Input::Command(Command::Load(path))),
+                                    Err(e) => return Ok(Input::Error(e.to_string())),
+                                }
+                            }
+                            unknown => {
+                                return Ok(Input::Error(format!("Unknown command {}", unknown)))
+                            }
+                        }
                     }
 
                     return Ok(Input::String(line.to_string()));

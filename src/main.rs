@@ -158,7 +158,33 @@ async fn main() -> crate::Result<()> {
                 }
             }
 
-            _ => {}
+            Input::Command(cmd) => match cmd {
+                crate::input::Command::Load(path) => {
+                    let content = tokio::fs::read(path).await?;
+                    match std::str::from_utf8(content.as_slice()) {
+                        Ok(source_code) => {
+                            let result =
+                                lua.context::<_, std::result::Result<(), rlua::Error>>(|context| {
+                                    context.load(source_code).exec()?;
+
+                                    Ok(())
+                                });
+
+                            if let Err(e) = result {
+                                println!("\nERR: {}", e);
+                            }
+                        }
+
+                        Err(e) => {
+                            println!("\nERR: {}", e);
+                        }
+                    }
+                }
+            },
+
+            Input::Error(e) => {
+                println!("\nERR: {}", e);
+            }
         }
     }
 
