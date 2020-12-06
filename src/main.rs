@@ -50,7 +50,7 @@ async fn main() -> crate::Result<()> {
         let stream_events = context.create_function_mut(move |ctx, stream_name| {
             block_in_place(|| {
                 match futures::executor::block_on(lua_impl::list_stream_events_impl(
-                    &inner_client.clone(),
+                    &inner_client,
                     stream_name,
                 )) {
                     Ok(events) => rlua_serde::to_value(ctx, events),
@@ -71,9 +71,60 @@ async fn main() -> crate::Result<()> {
             })
         })?;
 
+        let inner_client = client.clone();
+        let emit = context.create_function_mut(
+            move |_, (stream_name, event_type, payload): (String, String, rlua::Value)| {
+                block_in_place(|| {
+                    let value = rlua_serde::from_value(payload)?;
+                    match futures::executor::block_on(lua_impl::emit_impl(
+                        &inner_client,
+                        stream_name,
+                        event_type,
+                        value,
+                    )) {
+                        Ok(result) => {
+                            if let Some(e) = result {
+                                return Err(rlua::Error::RuntimeError(e.to_string()));
+                            }
+
+                            Ok(())
+                        }
+
+                        Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+                    }
+                })
+            },
+        )?;
+
+        let inner_client = client.clone();
+        let link = context.create_function_mut(
+            move |_, (stream_name, payload): (String, rlua::Value)| {
+                block_in_place(|| {
+                    let link = rlua_serde::from_value(payload)?;
+                    match futures::executor::block_on(lua_impl::link_impl(
+                        &inner_client,
+                        stream_name,
+                        link,
+                    )) {
+                        Ok(result) => {
+                            if let Some(e) = result {
+                                return Err(rlua::Error::RuntimeError(e.to_string()));
+                            }
+
+                            Ok(())
+                        }
+
+                        Err(e) => Err(rlua::Error::RuntimeError(e.to_string())),
+                    }
+                })
+            },
+        )?;
+
         context.globals().set("streams", streams_fn)?;
         context.globals().set("stream_events", stream_events)?;
         context.globals().set("server_version", server_version)?;
+        context.globals().set("emit", emit)?;
+        context.globals().set("link", link)?;
 
         Ok(())
     })?;

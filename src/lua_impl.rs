@@ -155,3 +155,33 @@ pub async fn server_version_impl(
 
     Ok(node_info.version)
 }
+
+pub async fn emit_impl(
+    client: &eventstore::Client,
+    stream_name: String,
+    event_type: String,
+    payload: serde_json::Value,
+) -> crate::Result<Option<eventstore::WrongExpectedVersion>> {
+    let event = eventstore::EventData::json(event_type, payload)?;
+    let result = client.write_events(stream_name).send_event(event).await?;
+
+    Ok(result.err())
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Link {
+    stream_id: String,
+    revision: u64,
+}
+
+pub async fn link_impl(
+    client: &eventstore::Client,
+    stream_name: String,
+    link: Link,
+) -> crate::Result<Option<eventstore::WrongExpectedVersion>> {
+    let event =
+        eventstore::EventData::binary("$>", format!("{}@{}", link.revision, link.stream_id).into());
+    let result = client.write_events(stream_name).send_event(event).await?;
+
+    Ok(result.err())
+}
