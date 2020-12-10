@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 rlua = "0.17.0"
 structopt = "0.3"
-eventstore = "0.9.8"
+eventstore = "0.9.9"
 tokio = { version = "0.2.23", features = ["rt-threaded", "macros", "fs"] }
 termion = "1.5.5"
 serde_json = "1"
@@ -20,3 +20,4 @@ base64 = "0.13"
 reqwest = { version = "0.10.9", default_features = false, features = ["rustls-tls", "json"] }
 bytes = "0.5"
 pretty_env_logger = "0.4.0"
+clap = "*"

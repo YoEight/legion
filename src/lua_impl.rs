@@ -60,19 +60,14 @@ pub async fn list_stream_events_impl(
                     });
 
                     let mut data = None;
-                    let mut is_json = false;
 
-                    if let Some(tpe) = event.metadata.get("content-type") {
-                        is_json = tpe == "application/json";
-                    }
-
-                    let raw = if is_json {
+                    let raw = if event.is_json {
                         std::str::from_utf8(event.data.as_ref()).unwrap().to_owned()
                     } else {
                         base64::encode(event.data.as_ref())
                     };
 
-                    if is_json {
+                    if event.is_json {
                         if let Some(value) =
                             serde_json::from_slice::<serde_json::Value>(event.data.as_ref()).ok()
                         {
@@ -98,7 +93,7 @@ pub async fn list_stream_events_impl(
                         "id": event.id,
                         "revision": event.revision,
                         "event_type": event.event_type,
-                        "is_json": is_json,
+                        "is_json": event.is_json,
                         "raw": raw,
                         "data": data,
                         "metadata": event.metadata,

@@ -254,9 +254,9 @@ dependencies = [
 
 [[package]]
 name = "eventstore"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1702951d54e39d67cffc4df672076384d01a113635aba740c96d5730848f9422"
+checksum = "299722e11e957e1d816414763ff9e16a27eed7279af888a571c189830a01ca36"
 dependencies = [
  "base64 0.12.3",
  "byteorder",
@@ -664,6 +664,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.13.0",
  "bytes",
+ "clap",
  "eventstore",
  "futures",
  "pretty_env_logger",

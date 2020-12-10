@@ -25,6 +25,16 @@ fn parse_connection_string(
     ClientSettings::parse_str(input)
 }
 
+static WELCOME: &'static str = "
+ | |              (_)            
+ | |     ___  __ _ _  ___  _ __  
+ | |    / _ \\/ _` | |/ _ \\| '_ \\ 
+ | |___|  __/ (_| | | (_) | | | |
+ |______\\___|\\__, |_|\\___/|_| |_|
+              __/ |              
+             |___/   
+";
+
 #[tokio::main]
 async fn main() -> crate::Result<()> {
     pretty_env_logger::init();
@@ -33,6 +43,8 @@ async fn main() -> crate::Result<()> {
     let client = Client::create(params.conn_setts.clone()).await?;
     let mut stdout = io::stdout();
     let lua = Lua::new();
+    println!("{}", WELCOME);
+    println!("Version: {}", clap::crate_version!());
 
     lua.context::<_, rlua::Result<()>>(move |context| {
         let http_client = reqwest::Client::new();
