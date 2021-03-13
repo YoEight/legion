@@ -673,6 +673,7 @@ dependencies = [
  "rlua_serde",
  "serde",
  "serde_json",
+ "sqlparser",
  "structopt",
  "termion",
  "tokio",
@@ -1405,6 +1406,15 @@ name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
+
+[[package]]
+name = "sqlparser"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b929a9577d01ee7cddb820696ed536868d81557d3c14363a7514d71add1d058"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "static_assertions"

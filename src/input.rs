@@ -14,6 +14,7 @@ pub enum Input {
 
 pub enum Command {
     Load(std::path::PathBuf),
+    SqlQuery(Vec<sqlparser::ast::Statement>),
 }
 
 pub struct Inputs {
@@ -146,6 +147,19 @@ impl Inputs {
 
                                 match path.canonicalize() {
                                     Ok(path) => return Ok(Input::Command(Command::Load(path))),
+                                    Err(e) => return Ok(Input::Error(e.to_string())),
+                                }
+                            }
+                            "sql" => {
+                                let query = params.join(" ");
+
+                                match sqlparser::parser::Parser::parse_sql(
+                                    &sqlparser::dialect::AnsiDialect {},
+                                    query.as_str(),
+                                ) {
+                                    Ok(stmts) => {
+                                        return Ok(Input::Command(Command::SqlQuery(stmts)))
+                                    }
                                     Err(e) => return Ok(Input::Error(e.to_string())),
                                 }
                             }

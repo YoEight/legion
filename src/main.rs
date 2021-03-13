@@ -2,6 +2,7 @@ mod conversion;
 mod history;
 mod input;
 mod lua_impl;
+mod sql;
 
 use crate::conversion::deserialize_repl_value;
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
@@ -26,13 +27,13 @@ fn parse_connection_string(
 }
 
 static WELCOME: &'static str = "
- | |              (_)            
- | |     ___  __ _ _  ___  _ __  
- | |    / _ \\/ _` | |/ _ \\| '_ \\ 
+ | |              (_)
+ | |     ___  __ _ _  ___  _ __
+ | |    / _ \\/ _` | |/ _ \\| '_ \\
  | |___|  __/ (_| | | (_) | | | |
  |______\\___|\\__, |_|\\___/|_| |_|
-              __/ |              
-             |___/   
+              __/ |
+             |___/
 ";
 
 #[tokio::main]
@@ -191,6 +192,12 @@ async fn main() -> crate::Result<()> {
                             println!("\nERR: {}", e);
                         }
                     }
+                }
+
+                crate::input::Command::SqlQuery(stmts) => {
+                    // println!("ast: {:?}", stmts);
+                    println!("\nbuild_plan: {:?}", sql::build_plan(stmts));
+
                 }
             },
 
