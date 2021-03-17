@@ -47,6 +47,7 @@ async fn main() -> crate::Result<()> {
     println!("{}", WELCOME);
     println!("Version: {}", clap::crate_version!());
 
+    let es_client = client.clone();
     lua.context::<_, rlua::Result<()>>(move |context| {
         let http_client = reqwest::Client::new();
         let inner_client = client.clone();
@@ -195,9 +196,11 @@ async fn main() -> crate::Result<()> {
                 }
 
                 crate::input::Command::SqlQuery(stmts) => {
-                    // println!("ast: {:?}", stmts);
-                    println!("\nbuild_plan: {:?}", sql::build_plan(stmts));
-
+                    let plan = sql::build_plan(stmts);
+                    if let Some(plan) = plan {
+                        let result = sql::execute_plan(&es_client, plan).await?;
+                        println!("\n>>>\n{}", serde_json::to_string_pretty(&result).unwrap());
+                    }
                 }
             },
 
