@@ -142,6 +142,8 @@ fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
 
         Expr::BinaryOp { left, op, right } => simplify_binary_op(env, *left, op, *right),
         Expr::UnaryOp { op, expr } => simplify_unary_op(env, op, *expr),
+        Expr::IsNull(expr) => simplify_is_null(env, *expr),
+        Expr::IsNotNull(expr) => simplify_is_not_null(env, *expr),
         
         expr => Ok(expr),
     }
@@ -318,6 +320,26 @@ fn simplify_unary_op(env: &Env, op: UnaryOperator, expr: Expr) -> Result<Expr, E
         (UnaryOperator::Not, SqlValue::Bool(boolean)) => Ok(SqlValue::Bool(!boolean).into_expr()),
 
         (op, expr) => Err(ExecutionError(format!("Unsupported unary operation: {} {}", op, expr))),
+    }
+}
+
+fn simplify_is_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(env, expr)?;
+    let expr = collect_sql_value(&expr)?;
+
+    match expr {
+        SqlValue::Null => Ok(SqlValue::Bool(true).into_expr()),
+        _ => Ok(SqlValue::Bool(false).into_expr()),
+    }
+}
+
+fn simplify_is_not_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(env, expr)?;
+    let expr = collect_sql_value(&expr)?;
+
+    match expr {
+        SqlValue::Null => Ok(SqlValue::Bool(false).into_expr()),
+        _ => Ok(SqlValue::Bool(true).into_expr()),
     }
 }
 
