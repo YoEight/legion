@@ -144,6 +144,7 @@ fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
         Expr::UnaryOp { op, expr } => simplify_unary_op(env, op, *expr),
         Expr::IsNull(expr) => simplify_is_null(env, *expr),
         Expr::IsNotNull(expr) => simplify_is_not_null(env, *expr),
+        Expr::Between { expr, negated, low, high } => simplify_between(env, *expr, negated, *low, *high),
         
         expr => Ok(expr),
     }
@@ -341,6 +342,31 @@ fn simplify_is_not_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
         SqlValue::Null => Ok(SqlValue::Bool(false).into_expr()),
         _ => Ok(SqlValue::Bool(true).into_expr()),
     }
+}
+
+fn simplify_between(env: &Env, expr: Expr, negated: bool, low: Expr, high: Expr) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(env, expr)?;
+    let low = simplify_expr(env, low)?;
+    let high = simplify_expr(env, high)?;
+    let expr = collect_sql_value(&expr)?;
+    let low = collect_sql_value(&low)?;
+    let high = collect_sql_value(&high)?;
+
+    let result = match (expr, low, high) {
+        (SqlValue::Number(value), SqlValue::Number(low), SqlValue::Number(high)) => Ok(value >= low && value <= high),
+        (SqlValue::Float(value), SqlValue::Float(low), SqlValue::Float(high)) => Ok(value >= low && value <= high),
+        (SqlValue::String(value), SqlValue::String(low), SqlValue::String(high)) => Ok(value >= low && value <= high),
+
+        (expr, low, high) => {
+            let negate_str = if negated { "NOT" } else { "" };
+
+            Err(ExecutionError(format!("Invalid between arguments: {} {} BETWEEN {} AND  {}", expr, negate_str, low, high)))
+        }
+    }?;
+
+    let result = if negated { !result } else { result };
+
+    Ok(SqlValue::Bool(result).into_expr())
 }
 
 fn execute_predicate(env: &Env, predicate_expr: &Expr) -> Result<bool, ExecutionError> {
