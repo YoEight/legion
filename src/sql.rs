@@ -1,6 +1,6 @@
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use sqlparser::ast::{ BinaryOperator, Expr, Ident};
+use sqlparser::ast::{ BinaryOperator, Expr, Ident, UnaryOperator};
 
 #[derive(Debug)]
 pub struct Plan {
@@ -141,6 +141,7 @@ fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
         }
 
         Expr::BinaryOp { left, op, right } => simplify_binary_op(env, *left, op, *right),
+        Expr::UnaryOp { op, expr } => simplify_unary_op(env, op, *expr),
         
         expr => Ok(expr),
     }
@@ -299,7 +300,24 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Number(left), BinaryOperator::BitwiseAnd, SqlValue::Number(right)) => Ok(SqlValue::Number(left & right).into_expr()),
         (SqlValue::Number(left), BinaryOperator::BitwiseXor, SqlValue::Number(right)) => Ok(SqlValue::Number(left ^ right).into_expr()),
 
-        (left, op, right) => Err(ExecutionError(format!("Unsupported operation: {} {} {}", left, op, right))),
+        (left, op, right) => Err(ExecutionError(format!("Unsupported binary operation: {} {} {}", left, op, right))),
+    }
+}
+
+fn simplify_unary_op(env: &Env, op: UnaryOperator, expr: Expr) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(env, expr)?;
+    let expr = collect_sql_value(&expr)?;
+
+    match (op, expr) {
+        (UnaryOperator::Plus, SqlValue::Number(expr)) => Ok(SqlValue::Number(expr).into_expr()),
+        (UnaryOperator::Plus, SqlValue::Float(expr)) => Ok(SqlValue::Float(expr).into_expr()),
+
+        (UnaryOperator::Minus, SqlValue::Number(expr)) => Ok(SqlValue::Number(-expr).into_expr()),
+        (UnaryOperator::Minus, SqlValue::Float(expr)) => Ok(SqlValue::Float(-expr).into_expr()),
+
+        (UnaryOperator::Not, SqlValue::Bool(boolean)) => Ok(SqlValue::Bool(!boolean).into_expr()),
+
+        (op, expr) => Err(ExecutionError(format!("Unsupported unary operation: {} {}", op, expr))),
     }
 }
 
