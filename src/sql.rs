@@ -267,14 +267,14 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
         (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
         (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
-        (SqlValue::Number(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Float(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::String(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Bool(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Float(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::String(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Number(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Float(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Bool(_)) => Ok(SqlValue::Bool(false).into_expr()),
 
         (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
         (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
@@ -290,6 +290,14 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Null, BinaryOperator::NotEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Bool(left), BinaryOperator::And, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left && right).into_expr()),
+
+        (SqlValue::Bool(left), BinaryOperator::Or, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left || right).into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::BitwiseOr, SqlValue::Number(right)) => Ok(SqlValue::Number(left | right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::BitwiseAnd, SqlValue::Number(right)) => Ok(SqlValue::Number(left & right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::BitwiseXor, SqlValue::Number(right)) => Ok(SqlValue::Number(left ^ right).into_expr()),
 
         (left, op, right) => Err(ExecutionError(format!("Unsupported operation: {} {} {}", left, op, right))),
     }
