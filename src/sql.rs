@@ -67,6 +67,13 @@ pub async fn execute_plan<'a>(client: &'a eventstore::Client, plan: Plan) -> Res
                 let mut json_payload = serde_json::from_slice::<HashMap<String, serde_json::Value>>(event.data.as_ref()).unwrap();
                 let mut line = HashMap::new();
 
+                json_payload.insert("es_type".to_string(), serde_json::to_value(event.event_type.as_str()).expect("valid json"));
+                json_payload.insert("es_stream_id".to_string(), serde_json::to_value(event.stream_id.as_str()).expect("valid json"));
+                json_payload.insert("es_event_id".to_string(), serde_json::to_value(event.id.to_string()).expect("valid json"));
+                json_payload.insert("es_revision".to_string(), serde_json::to_value(&event.revision).expect("valid json"));
+                json_payload.insert("es_commit".to_string(), serde_json::to_value(&event.position.commit).expect("valid json"));
+                json_payload.insert("es_prepare".to_string(), serde_json::to_value(&event.position.prepare).expect("valid json"));
+
                 if let Some(expr) = plan.predicate.as_ref() {
                     let passed = execute_predicate(&json_payload, expr)?;
 
@@ -112,6 +119,7 @@ impl std::fmt::Display for ExecutionError {
 
 impl std::error::Error for ExecutionError {}
 
+#[derive(Debug)]
 enum SqlValue {
     Ident(String),
     Bool(bool),
@@ -211,6 +219,9 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
     let right = simplify_expr(env, right)?;
     let left = collect_sql_value(&left)?;
     let right = collect_sql_value(&right)?;
+
+    //println!("DEBUG: {:?} {:?} {:?}", left, op, right);
+    //println!("DEBUG: {} {} {}", left, op, right);
 
     match (left, op, right) {
         (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Number(right)) => Ok(SqlValue::Number(left + right).into_expr()),
@@ -492,30 +503,6 @@ fn execute_predicate(env: &Env, predicate_expr: &Expr) -> Result<bool, Execution
     }
 }
 
-fn execute_binary_predicate(env: &Env, mut left: &Expr, op: &BinaryOperator, mut right: &Expr) -> Result<bool, ExecutionError> {
-    let mut left = collect_sql_value(left)?;
-    let mut right = collect_sql_value(right)?;
-
-    if let SqlValue::Ident(ident) = left {
-        left = resolve_name(env, ident)?;
-    }
-
-    if let SqlValue::Ident(ident) = right {
-        right = resolve_name(env, ident)?;
-    }
-    
-    match (left, right) {
-        (SqlValue::Number(left), SqlValue::Number(right)) => binary_op_number(left, op, right),
-        (SqlValue::Float(left), SqlValue::Float(right)) => binary_op_float(left, op, right),
-        (SqlValue::String(left), SqlValue::String(right)) => binary_op_string(left, op, right),
-        (SqlValue::Bool(left), SqlValue::Bool(right)) => binary_op_bool(left, op, right),
-        (SqlValue::Null, SqlValue::Null) => binary_op_null(op),
-        (SqlValue::Null, _) => Ok(false),
-        (_, SqlValue::Null) => Ok(false),
-        (left, right) => Err(ExecutionError(format!("{} {} {}", left, op, right))),
-    }
-}
-
 fn resolve_name(env: &Env, name: String) -> Result<SqlValue, ExecutionError> {
     if let Some(value) = env.get(&name) {
         return collect_json_literal(value);
@@ -524,61 +511,6 @@ fn resolve_name(env: &Env, name: String) -> Result<SqlValue, ExecutionError> {
     Ok(SqlValue::Null)
 }
 
-fn binary_op_number(left: i64, op: &BinaryOperator, right: i64) -> Result<bool, ExecutionError> {
-    match op {
-        &BinaryOperator::Eq => Ok(left == right),
-        &BinaryOperator::NotEq => Ok(left != right),
-        &BinaryOperator::Gt => Ok(left > right),
-        &BinaryOperator::Lt => Ok(left < right),
-        &BinaryOperator::GtEq => Ok(left >= right),
-        &BinaryOperator::LtEq => Ok(left <= right),
-        unsupported => Err(ExecutionError(format!("Unsupported binary operation on numbers: {}", unsupported))),
-    }
-}
-
-fn binary_op_float(left: f64, op: &BinaryOperator, right: f64) -> Result<bool, ExecutionError> {
-    match op {
-        &BinaryOperator::Eq => Ok(left == right),
-        &BinaryOperator::NotEq => Ok(left != right),
-        &BinaryOperator::Gt => Ok(left > right),
-        &BinaryOperator::Lt => Ok(left < right),
-        &BinaryOperator::GtEq => Ok(left >= right),
-        &BinaryOperator::LtEq => Ok(left <= right),
-        unsupported => Err(ExecutionError(format!("Unsupported binary operation on floats: {}", unsupported))),
-    }
-}
-
-fn binary_op_string(left: String, op: &BinaryOperator, right: String) -> Result<bool, ExecutionError> {
-    match op {
-        &BinaryOperator::Eq => Ok(left == right),
-        &BinaryOperator::NotEq => Ok(left != right),
-        &BinaryOperator::Gt => Ok(left > right),
-        &BinaryOperator::Lt => Ok(left < right),
-        &BinaryOperator::GtEq => Ok(left >= right),
-        &BinaryOperator::LtEq => Ok(left <= right),
-        &BinaryOperator::Like => Err(ExecutionError("Unsuppoted like/not like operations on strings".to_string())),
-        &BinaryOperator::NotLike => Err(ExecutionError("Unsuppoted like/not like operations on strings".to_string())),
-        unsupported => Err(ExecutionError(format!("Unsupported binary operation on strings: {}", unsupported))),
-    }
-}
-
-fn binary_op_bool(left: bool, op: &BinaryOperator, right: bool) -> Result<bool, ExecutionError> {
-    match op {
-        &BinaryOperator::Eq => Ok(left == right),
-        &BinaryOperator::NotEq => Ok(left != right),
-        &BinaryOperator::And => Ok(left && right),
-        &BinaryOperator::Or => Ok(left || right),
-        unsupported => Err(ExecutionError(format!("Unsupported binary operation on booleans: {}", unsupported))),
-    }
-}
-
-fn binary_op_null(op: &BinaryOperator) -> Result<bool, ExecutionError> {
-    match op {
-        &BinaryOperator::Eq => Ok(true),
-        &BinaryOperator::NotEq => Ok(false),
-        unsupported => Err(ExecutionError(format!("Unsupported binary operation on NULL: {}", unsupported))),
-    }
-}
 
 fn collect_json_literal(value: &serde_json::Value) -> Result<SqlValue, ExecutionError> {
     match value {
@@ -590,7 +522,11 @@ fn collect_json_literal(value: &serde_json::Value) -> Result<SqlValue, Execution
                 return Ok(SqlValue::Number(value));
             }
 
-            if let Some(value) = value.as_u64() {
+            if let Some(mut value) = value.as_u64() {
+                // Please don't judge me!
+                if value == u64::MAX {
+                    value = i64::MAX as u64;
+                }
                 return Ok(SqlValue::Number(value as i64));
             }
 
