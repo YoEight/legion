@@ -1,6 +1,6 @@
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use sqlparser::ast::{ BinaryOperator, Expr};
+use sqlparser::ast::{ BinaryOperator, Expr, Ident};
 
 #[derive(Debug)]
 pub struct Plan {
@@ -106,6 +106,19 @@ enum SqlValue {
     Null,
 }
 
+impl SqlValue {
+    fn into_expr(self) -> Expr {
+        match self {
+            SqlValue::Ident(s) => Expr::Identifier(Ident { value: s, quote_style: None }),
+            SqlValue::Bool(b) => Expr::Value(sqlparser::ast::Value::Boolean(b)),
+            SqlValue::Number(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), true)),
+            SqlValue::Float(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
+            SqlValue::String(s) => Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)),
+            SqlValue::Null => Expr::Value(sqlparser::ast::Value::Null),
+        }
+    }
+}
+
 impl std::fmt::Display for SqlValue {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -116,6 +129,169 @@ impl std::fmt::Display for SqlValue {
             SqlValue::String(ref value) => write!(f, "\"{}\"", value),
             SqlValue::Null => write!(f, "NULL"),
         }
+    }
+}
+
+fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
+    match expr {
+        Expr::Identifier(ident) => {
+            let value = resolve_name(env, ident.value)?;
+
+            Ok(value.into_expr())
+        }
+
+        Expr::BinaryOp { left, op, right } => simplify_binary_op(env, *left, op, *right),
+        
+        expr => Ok(expr),
+    }
+}
+
+fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) -> Result<Expr, ExecutionError> {
+    let left = simplify_expr(env, left)?;
+    let right = simplify_expr(env, right)?;
+    let left = collect_sql_value(&left)?;
+    let right = collect_sql_value(&right)?;
+
+    match (left, op, right) {
+        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Number(right)) => Ok(SqlValue::Number(left + right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Float(right)) => Ok(SqlValue::Float(left + right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 + right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Number(right)) => Ok(SqlValue::Float(left + right as f64).into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Number(right)) => Ok(SqlValue::Number(left - right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Float(right)) => Ok(SqlValue::Float(left - right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 - right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Number(right)) => Ok(SqlValue::Float(left - right as f64).into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Number(right)) => Ok(SqlValue::Number(left * right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Float(right)) => Ok(SqlValue::Float(left * right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 * right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Number(right)) => Ok(SqlValue::Float(left * right as f64).into_expr()),
+
+        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => Err(ExecutionError("Divide by 0 error.".to_string())),
+        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => Err(ExecutionError("Divide by 0 error.".to_string())),
+        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => Err(ExecutionError("Divide by 0 error.".to_string())),
+        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => Err(ExecutionError("Divide by 0 error.".to_string())),
+        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Number(right)) => Ok(SqlValue::Number(left / right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Float(right)) => Ok(SqlValue::Float(left / right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 / right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Number(right)) => Ok(SqlValue::Float(left / right as f64).into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Modulus, SqlValue::Number(right)) => Ok(SqlValue::Number(left % right).into_expr()),
+
+        (SqlValue::String(left), BinaryOperator::StringConcat, SqlValue::String(right)) => Ok(SqlValue::String(format!("{}{}", left, right)).into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 > right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left > right as f64).into_expr()),
+        (SqlValue::String(left), BinaryOperator::Gt, SqlValue::String(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::Gt, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Float(right)) => Ok(SqlValue::Bool((left as f64) < right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left < right as f64).into_expr()),
+        (SqlValue::String(left), BinaryOperator::Lt, SqlValue::String(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::Lt, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 >= right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left >= right as f64).into_expr()),
+        (SqlValue::String(left), BinaryOperator::GtEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::GtEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 <= right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left <= right as f64).into_expr()),
+        (SqlValue::String(left), BinaryOperator::LtEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::LtEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::String(left), BinaryOperator::Eq, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::Eq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Eq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Eq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Eq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Eq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::String(left), BinaryOperator::Spaceship, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::Spaceship, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::String(left), BinaryOperator::NotEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::NotEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
+        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Float(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::String(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Bool(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+
+        (left, op, right) => Err(ExecutionError(format!("Unsupported operation: {} {} {}", left, op, right))),
     }
 }
 
