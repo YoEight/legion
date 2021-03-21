@@ -11,6 +11,7 @@ use rlua::Lua;
 use std::io;
 use structopt::StructOpt;
 use tokio::task::block_in_place;
+use futures::stream::TryStreamExt;
 
 type Result<A> = std::result::Result<A, Box<dyn std::error::Error>>;
 
@@ -198,8 +199,26 @@ async fn main() -> crate::Result<()> {
                 crate::input::Command::SqlQuery(stmts) => {
                     let plan = sql::build_plan(stmts);
                     if let Some(plan) = plan {
-                        let result = sql::execute_plan(&es_client, plan).await?;
-                        println!("\n>>>\n{}", serde_json::to_string_pretty(&result).unwrap());
+                        let mut stream = sql::execute_plan(&es_client, plan).await?;
+                        println!("\n>>>\n");
+
+                        loop {
+                            match stream.try_next().await {
+                                Ok(line) => {
+                                    if let Some(line) = line {
+                                        println!("{}", serde_json::to_string_pretty(&line).expect("valid json"));
+                                        continue;
+                                    }
+
+                                    break;
+                                }
+
+                                Err(e) => {
+                                    println!("ERR: {}", e);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             },

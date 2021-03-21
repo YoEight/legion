@@ -1,12 +1,14 @@
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use sqlparser::ast::{ BinaryOperator, Expr, Ident, UnaryOperator};
+use futures::stream::BoxStream;
 
 #[derive(Debug)]
 pub struct Plan {
     stream_name: String,
     count: usize,
     fields: Vec<String>,
+    predicate: Option<Expr>,
 }
 
 impl Default for Plan {
@@ -15,6 +17,7 @@ impl Default for Plan {
             stream_name: "".to_string(),
             count: usize::MAX,
             fields: Vec::new(),
+            predicate: None,
         }
     }
 }
@@ -41,6 +44,8 @@ pub fn build_plan(mut stmts: Vec<sqlparser::ast::Statement>) -> Option<Plan> {
                 plan.stream_name = name.value;
             }
 
+            plan.predicate = select.selection;
+
             return Some(plan)
         }
     }
@@ -48,40 +53,50 @@ pub fn build_plan(mut stmts: Vec<sqlparser::ast::Statement>) -> Option<Plan> {
     None
 }
 
-pub async fn execute_plan(client: &eventstore::Client, plan: Plan) -> eventstore::Result<Vec<serde_json::Value>> {
-    let result = client.read_stream(plan.stream_name)
+pub async fn execute_plan<'a>(client: &'a eventstore::Client, plan: Plan) -> Result<BoxStream<'a, Result<serde_json::Value, ExecutionError>>, Box<dyn std::error::Error>> {
+    let result = client.read_stream(plan.stream_name.as_str())
         .start_from_beginning()
         .read_through()
         .await?;
 
     if let Some(mut stream) = result.ok() {
-        let mut events = vec![];
+        let output = async_stream::try_stream! {
+            while let Ok(Some(event)) = stream.try_next().await {
+                let event = event.get_original_event();
+                
+                let mut json_payload = serde_json::from_slice::<HashMap<String, serde_json::Value>>(event.data.as_ref()).unwrap();
+                let mut line = HashMap::new();
 
-        while let Some(event) = stream.try_next().await? {
-            let event = event.get_original_event();
-            
-            let mut json_payload = serde_json::from_slice::<HashMap<String, serde_json::Value>>(event.data.as_ref()).unwrap();
-            let mut output = HashMap::new();
+                if let Some(expr) = plan.predicate.as_ref() {
+                    let passed = execute_predicate(&json_payload, expr)?;
 
-            if plan.fields.is_empty() {
-                output = json_payload;
-            } else {
-                for field in plan.fields.iter() {
-                    if let Some(value) = json_payload.remove(field) {
-                        output.insert(field.clone(), value);
-                    } else {
-                        output.insert(field.clone(), serde_json::Value::Null);
+                    if !passed {
+                        continue;
                     }
                 }
+
+                if plan.fields.is_empty() {
+                    line = json_payload;
+                } else {
+                    for field in plan.fields.iter() {
+                        if let Some(value) = json_payload.remove(field) {
+                            line.insert(field.clone(), value);
+                        } else {
+                            line.insert(field.clone(), serde_json::Value::Null);
+                        }
+                    }
+                }
+
+                yield serde_json::to_value(line).expect("valid json");
             }
+        };
 
-            events.push(serde_json::to_value(output).expect("is valid json"));
-        }
+        let output: BoxStream<'a, Result<serde_json::Value, ExecutionError>> = Box::pin(output);
 
-        return Ok(events);
+        return Ok(output);
     }
 
-    Ok(vec![])
+    Err(ExecutionError(format!("Stream {} doesn't exist.", plan.stream_name)).into())
 }
 
 type Env = HashMap<String, serde_json::Value>;
@@ -117,6 +132,45 @@ impl SqlValue {
             SqlValue::Null => Expr::Value(sqlparser::ast::Value::Null),
         }
     }
+
+    fn is_same_type(&self, expr: &SqlValue) -> bool {
+        match (self, expr) {
+            (SqlValue::Number(_), SqlValue::Number(_)) => true, 
+            (SqlValue::Float(_), SqlValue::Float(_)) => true, 
+            (SqlValue::String(_), SqlValue::String(_)) => true, 
+            (SqlValue::Bool(_), SqlValue::Bool(_)) => true, 
+            _ => false,
+        }
+    }
+
+    fn from_expr(expr: Expr) -> Result<SqlValue, ExecutionError> {
+        if let Expr::Value(value) = expr {
+            return match value {
+                sqlparser::ast::Value::Number(value, is_long) => {
+                    if is_long {
+                        return match value.parse::<i64>() {
+                            Ok(value) => Ok(SqlValue::Number(value)),
+                            Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
+                        }
+                    }
+
+                    match value.parse::<f64>() {
+                        Ok(value) => Ok(SqlValue::Float(value)),
+                        Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
+                    }
+                }
+
+                sqlparser::ast::Value::SingleQuotedString(value) => Ok(SqlValue::String(value)),
+                sqlparser::ast::Value::DoubleQuotedString(value) => Ok(SqlValue::String(value)),
+                sqlparser::ast::Value::Boolean(value) => Ok(SqlValue::Bool(value)),
+                sqlparser::ast::Value::Null => Ok(SqlValue::Null),
+
+                unsupported => Err(ExecutionError(format!("Unsuppored SQL literal: {}", unsupported))),
+            };
+        }
+
+        Err(ExecutionError(format!("Expected SQL literal but got: {}", expr)))
+    }
 }
 
 impl std::fmt::Display for SqlValue {
@@ -145,6 +199,8 @@ fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
         Expr::IsNull(expr) => simplify_is_null(env, *expr),
         Expr::IsNotNull(expr) => simplify_is_not_null(env, *expr),
         Expr::Between { expr, negated, low, high } => simplify_between(env, *expr, negated, *low, *high),
+        Expr::InList { expr, list, negated } => simplify_in_list(env, *expr, list, negated),
+        Expr::Nested(expr) => simplify_nested(env, *expr),
         
         expr => Ok(expr),
     }
@@ -369,10 +425,70 @@ fn simplify_between(env: &Env, expr: Expr, negated: bool, low: Expr, high: Expr)
     Ok(SqlValue::Bool(result).into_expr())
 }
 
+fn simplify_in_list(env: &Env, expr: Expr, list: Vec<Expr>, negated: bool) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(env, expr)?;
+    let expr = collect_sql_value(&expr)?;
+    let mut result = false;
+
+    for elem_expr in list {
+        let elem_expr = simplify_expr(env, elem_expr)?;
+        let elem_expr = collect_sql_value(&elem_expr)?;
+
+        if !expr.is_same_type(&elem_expr) {
+            return Err(ExecutionError("IN LIST operation contains elements that have a different time than target expression".to_string()));
+        }
+
+        match (&expr, elem_expr) {
+            (SqlValue::Number(ref x), SqlValue::Number(y)) => {
+                if *x == y {
+                    result = true;
+                    break;
+                }
+            }
+
+            (SqlValue::Float(ref x), SqlValue::Float(y)) => {
+                // We all know doing equality checks over floats is stupid but it is what it is.
+                if *x == y {
+                    result = true;
+                    break;
+                }
+            }
+
+            (SqlValue::String(ref x), SqlValue::String(ref y)) => {
+                if x == y {
+                    result = true;
+                    break;
+                }
+            }
+
+            (SqlValue::Bool(ref x), SqlValue::Bool(y)) => {
+                if *x == y {
+                    result = true;
+                    break;
+                }
+            }
+
+            _ => unreachable!(),
+        }
+    }
+
+    result = if negated { !result } else { result };
+
+    Ok(SqlValue::Bool(result).into_expr())
+}
+
+fn simplify_nested(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
+    Ok(simplify_expr(env, expr)?)
+}
+
 fn execute_predicate(env: &Env, predicate_expr: &Expr) -> Result<bool, ExecutionError> {
-    match predicate_expr {
-        Expr::BinaryOp { ref left, ref op, ref right } => execute_binary_predicate(env, left, op, right),
-        _ => Err(ExecutionError("Invalid predicate expression".to_string())),
+    let expr = simplify_expr(env, predicate_expr.clone())?;
+    let expr = collect_sql_value(&expr)?;
+
+    match expr {
+        SqlValue::Bool(value) => Ok(value),
+        SqlValue::Null => Ok(false),
+        expr => Err(ExecutionError(format!("Where predicate was not a boolean, got: {}", expr))),
     }
 }
 
@@ -405,7 +521,7 @@ fn resolve_name(env: &Env, name: String) -> Result<SqlValue, ExecutionError> {
         return collect_json_literal(value);
     }
     
-    Err(ExecutionError(format!("Unresolved symbol: {}", name)))
+    Ok(SqlValue::Null)
 }
 
 fn binary_op_number(left: i64, op: &BinaryOperator, right: i64) -> Result<bool, ExecutionError> {
