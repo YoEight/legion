@@ -2,6 +2,11 @@ use futures::TryStreamExt;
 use std::collections::HashMap;
 use sqlparser::ast::{ BinaryOperator, Expr, Ident, UnaryOperator};
 use futures::stream::BoxStream;
+use nom::character::complete::{char, anychar, satisfy};
+use nom::combinator::{ flat_map, opt, success };
+use nom::multi::fold_many1;
+use nom::{InputIter, IResult, Slice, AsChar};
+use std::ops::RangeFrom;
 
 #[derive(Debug)]
 pub struct Plan {
@@ -366,12 +371,69 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
 
         (SqlValue::Bool(left), BinaryOperator::Or, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left || right).into_expr()),
 
+        (SqlValue::String(left), BinaryOperator::Like, SqlValue::String(right)) => simplify_like(left, right, false),
+        (SqlValue::Null, BinaryOperator::Like, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
+
+        (SqlValue::String(left), BinaryOperator::NotLike, SqlValue::String(right)) => simplify_like(left, right, false),
+        (SqlValue::Null, BinaryOperator::NotLike, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
+
         (SqlValue::Number(left), BinaryOperator::BitwiseOr, SqlValue::Number(right)) => Ok(SqlValue::Number(left | right).into_expr()),
         (SqlValue::Number(left), BinaryOperator::BitwiseAnd, SqlValue::Number(right)) => Ok(SqlValue::Number(left & right).into_expr()),
         (SqlValue::Number(left), BinaryOperator::BitwiseXor, SqlValue::Number(right)) => Ok(SqlValue::Number(left ^ right).into_expr()),
 
         (left, op, right) => Err(ExecutionError(format!("Unsupported binary operation: {} {} {}", left, op, right))),
     }
+}
+
+fn simplify_like(left: String, right: String, negated: bool) -> Result<Expr, ExecutionError> {
+    let (tpe, content) = parse_like_expr(right)?;
+
+    match tpe {
+        Like::StartWith => Ok(SqlValue::Bool(!negated && left.starts_with(content.as_str())).into_expr()),
+        Like::EndWith => Ok(SqlValue::Bool(!negated && left.ends_with(content.as_str())).into_expr()),
+        Like::Contains => Ok(SqlValue::Bool(!negated &&  left.contains(content.as_str())).into_expr()),
+    }
+ }
+
+#[derive(Clone)]
+enum Like {
+    StartWith,
+    Contains,
+    EndWith,
+}
+
+fn parse_like_expr(input: String) -> Result<(Like, String), ExecutionError> {
+    let mut start = false;
+    let mut end = false;
+    let mut content = String::new();
+
+    for (idx, c) in input.char_indices() {
+        if idx == 0 && c == '%' {
+            start = true;
+            continue;
+        }
+
+        if idx == input.len() - 1 && c == '%' {
+            end = true;
+            continue;
+        }
+
+        content.push(c);
+    }
+
+    if start && end {
+        return Ok((Like::Contains, content));
+    }
+
+    if start {
+        return Ok((Like::EndWith, content));
+    }
+
+    if end {
+        return Ok((Like::StartWith, content));
+    }
+
+    Err(ExecutionError(format!("Malformed (NOT) LIKE expression: {}", input)))
 }
 
 fn simplify_unary_op(env: &Env, op: UnaryOperator, expr: Expr) -> Result<Expr, ExecutionError> {
