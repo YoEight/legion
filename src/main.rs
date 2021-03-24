@@ -6,12 +6,12 @@ mod sql;
 
 use crate::conversion::deserialize_repl_value;
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
+use futures::stream::TryStreamExt;
 use input::Input;
 use rlua::Lua;
 use std::io;
 use structopt::StructOpt;
 use tokio::task::block_in_place;
-use futures::stream::TryStreamExt;
 
 type Result<A> = std::result::Result<A, Box<dyn std::error::Error>>;
 
@@ -207,7 +207,11 @@ async fn main() -> crate::Result<()> {
                             match stream.try_next().await {
                                 Ok(line) => {
                                     if let Some(line) = line {
-                                        println!("{}", serde_json::to_string_pretty(&line).expect("valid json"));
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&line)
+                                                .expect("valid json")
+                                        );
                                         continue;
                                     }
 

@@ -1,11 +1,12 @@
-use futures::TryStreamExt;
-use std::collections::HashMap;
-use sqlparser::ast::{ BinaryOperator, Expr, Ident, UnaryOperator};
+use core::pin::Pin;
 use futures::stream::BoxStream;
-use nom::character::complete::{char, anychar, satisfy};
-use nom::combinator::{ flat_map, opt, success };
+use futures::{Future, TryStreamExt};
+use nom::character::complete::{anychar, char, satisfy};
+use nom::combinator::{flat_map, opt, success};
 use nom::multi::fold_many1;
-use nom::{InputIter, IResult, Slice, AsChar};
+use nom::{AsChar, IResult, InputIter, Slice};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, Query, UnaryOperator};
+use std::collections::HashMap;
 use std::ops::RangeFrom;
 
 #[derive(Debug)]
@@ -29,37 +30,47 @@ impl Default for Plan {
 
 pub fn build_plan(mut stmts: Vec<sqlparser::ast::Statement>) -> Option<Plan> {
     let stmt = stmts.pop()?;
-    let mut plan = Plan::default();
 
     if let sqlparser::ast::Statement::Query(query) = stmt {
-        if let sqlparser::ast::SetExpr::Select(mut select) = query.body {
-            for item in select.projection {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = item {
-                    if let sqlparser::ast::Expr::Identifier(ident) = expr {
-                        plan.fields.push(ident.value);
-                    }
-                }
-            }
-
-            let from = select.from.pop()?;
-
-            if let sqlparser::ast::TableFactor::Table { mut name, ..} = from.relation {
-                let name = name.0.pop()?;
-
-                plan.stream_name = name.value;
-            }
-
-            plan.predicate = select.selection;
-
-            return Some(plan)
-        }
+        return build_plan_from_query(*query);
     }
 
     None
 }
 
-pub async fn execute_plan<'a>(client: &'a eventstore::Client, plan: Plan) -> Result<BoxStream<'a, Result<serde_json::Value, ExecutionError>>, Box<dyn std::error::Error>> {
-    let result = client.read_stream(plan.stream_name.as_str())
+pub fn build_plan_from_query(query: Query) -> Option<Plan> {
+    let mut plan = Plan::default();
+    if let sqlparser::ast::SetExpr::Select(mut select) = query.body {
+        for item in select.projection {
+            if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = item {
+                if let sqlparser::ast::Expr::Identifier(ident) = expr {
+                    plan.fields.push(ident.value);
+                }
+            }
+        }
+
+        let from = select.from.pop()?;
+
+        if let sqlparser::ast::TableFactor::Table { mut name, .. } = from.relation {
+            let name = name.0.pop()?;
+
+            plan.stream_name = name.value;
+        }
+
+        plan.predicate = select.selection;
+
+        return Some(plan);
+    }
+
+    None
+}
+
+pub async fn execute_plan<'a>(
+    client: &'a eventstore::Client,
+    plan: Plan,
+) -> Result<BoxStream<'a, Result<serde_json::Value, ExecutionError>>, Box<dyn std::error::Error>> {
+    let result = client
+        .read_stream(plan.stream_name.as_str())
         .start_from_beginning()
         .read_through()
         .await?;
@@ -68,7 +79,7 @@ pub async fn execute_plan<'a>(client: &'a eventstore::Client, plan: Plan) -> Res
         let output = async_stream::try_stream! {
             while let Ok(Some(event)) = stream.try_next().await {
                 let event = event.get_original_event();
-                
+
                 let mut json_payload = serde_json::from_slice::<HashMap<String, serde_json::Value>>(event.data.as_ref()).unwrap();
                 let mut line = HashMap::new();
 
@@ -80,7 +91,7 @@ pub async fn execute_plan<'a>(client: &'a eventstore::Client, plan: Plan) -> Res
                 json_payload.insert("es_prepare".to_string(), serde_json::to_value(&event.position.prepare).expect("valid json"));
 
                 if let Some(expr) = plan.predicate.as_ref() {
-                    let passed = execute_predicate(&json_payload, expr)?;
+                    let passed = execute_predicate(client, &json_payload, expr).await?;
 
                     if !passed {
                         continue;
@@ -137,7 +148,10 @@ enum SqlValue {
 impl SqlValue {
     fn into_expr(self) -> Expr {
         match self {
-            SqlValue::Ident(s) => Expr::Identifier(Ident { value: s, quote_style: None }),
+            SqlValue::Ident(s) => Expr::Identifier(Ident {
+                value: s,
+                quote_style: None,
+            }),
             SqlValue::Bool(b) => Expr::Value(sqlparser::ast::Value::Boolean(b)),
             SqlValue::Number(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), true)),
             SqlValue::Float(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
@@ -148,10 +162,10 @@ impl SqlValue {
 
     fn is_same_type(&self, expr: &SqlValue) -> bool {
         match (self, expr) {
-            (SqlValue::Number(_), SqlValue::Number(_)) => true, 
-            (SqlValue::Float(_), SqlValue::Float(_)) => true, 
-            (SqlValue::String(_), SqlValue::String(_)) => true, 
-            (SqlValue::Bool(_), SqlValue::Bool(_)) => true, 
+            (SqlValue::Number(_), SqlValue::Number(_)) => true,
+            (SqlValue::Float(_), SqlValue::Float(_)) => true,
+            (SqlValue::String(_), SqlValue::String(_)) => true,
+            (SqlValue::Bool(_), SqlValue::Bool(_)) => true,
             _ => false,
         }
     }
@@ -163,13 +177,19 @@ impl SqlValue {
                     if is_long {
                         return match value.parse::<i64>() {
                             Ok(value) => Ok(SqlValue::Number(value)),
-                            Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
-                        }
+                            Err(e) => Err(ExecutionError(format!(
+                                "Invalid number value format: {}",
+                                e
+                            ))),
+                        };
                     }
 
                     match value.parse::<f64>() {
                         Ok(value) => Ok(SqlValue::Float(value)),
-                        Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
+                        Err(e) => Err(ExecutionError(format!(
+                            "Invalid number value format: {}",
+                            e
+                        ))),
                     }
                 }
 
@@ -178,11 +198,17 @@ impl SqlValue {
                 sqlparser::ast::Value::Boolean(value) => Ok(SqlValue::Bool(value)),
                 sqlparser::ast::Value::Null => Ok(SqlValue::Null),
 
-                unsupported => Err(ExecutionError(format!("Unsuppored SQL literal: {}", unsupported))),
+                unsupported => Err(ExecutionError(format!(
+                    "Unsuppored SQL literal: {}",
+                    unsupported
+                ))),
             };
         }
 
-        Err(ExecutionError(format!("Expected SQL literal but got: {}", expr)))
+        Err(ExecutionError(format!(
+            "Expected SQL literal but got: {}",
+            expr
+        )))
     }
 }
 
@@ -199,7 +225,35 @@ impl std::fmt::Display for SqlValue {
     }
 }
 
-fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
+struct Stack(Vec<Expr>);
+
+impl Stack {
+    fn new() -> Self {
+        Stack(Vec::new())
+    }
+
+    fn push(&mut self, expr: Expr) {
+        self.0.push(expr);
+    }
+
+    fn pop(&mut self) -> Result<Expr, ExecutionError> {
+        if let Some(expr) = self.0.pop() {
+            return Ok(expr);
+        }
+
+        Err(ExecutionError("Unexpected end of stack".to_string()))
+    }
+}
+
+async fn simplify_expr(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+) -> Result<Expr, ExecutionError> {
+
+    loop {}
+
     match expr {
         Expr::Identifier(ident) => {
             let value = resolve_name(env, ident.value)?;
@@ -207,21 +261,44 @@ fn simplify_expr(env: &Env, expr: Expr) -> Result<Expr, ExecutionError>  {
             Ok(value.into_expr())
         }
 
-        Expr::BinaryOp { left, op, right } => simplify_binary_op(env, *left, op, *right),
-        Expr::UnaryOp { op, expr } => simplify_unary_op(env, op, *expr),
-        Expr::IsNull(expr) => simplify_is_null(env, *expr),
-        Expr::IsNotNull(expr) => simplify_is_not_null(env, *expr),
-        Expr::Between { expr, negated, low, high } => simplify_between(env, *expr, negated, *low, *high),
-        Expr::InList { expr, list, negated } => simplify_in_list(env, *expr, list, negated),
-        Expr::Nested(expr) => simplify_nested(env, *expr),
-        
+        Expr::BinaryOp { left, op, right } => {
+            simplify_binary_op(stack, client, env, *left, op, *right).await
+        }
+        Expr::UnaryOp { op, expr } => simplify_unary_op(stack, client, env, op, *expr).await,
+        Expr::IsNull(expr) => simplify_is_null(stack, client, env, *expr).await,
+        Expr::IsNotNull(expr) => simplify_is_not_null(stack, client, env, *expr).await,
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => simplify_between(stack, client, env, *expr, negated, *low, *high).await,
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => simplify_in_list(stack, client, env, *expr, list, negated).await,
+        Expr::Nested(expr) => simplify_nested(stack, client, env, *expr).await,
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => simplify_subquery(stack, client, env, *expr, *subquery, negated).await,
+
         expr => Ok(expr),
     }
 }
 
-fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) -> Result<Expr, ExecutionError> {
-    let left = simplify_expr(env, left)?;
-    let right = simplify_expr(env, right)?;
+async fn simplify_binary_op(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    left: Expr,
+    op: BinaryOperator,
+    right: Expr,
+) -> Result<Expr, ExecutionError> {
+    let left = simplify_expr(stack, client, env, left).await?;
+    let right = simplify_expr(stack, client, env, right).await?;
     let left = collect_sql_value(&left)?;
     let right = collect_sql_value(&right)?;
 
@@ -229,41 +306,99 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
     //println!("DEBUG: {} {} {}", left, op, right);
 
     match (left, op, right) {
-        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Number(right)) => Ok(SqlValue::Number(left + right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Float(right)) => Ok(SqlValue::Float(left + right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 + right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Number(right)) => Ok(SqlValue::Float(left + right as f64).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left + right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left + right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Plus, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left as f64 + right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Plus, SqlValue::Number(right)) => {
+            Ok(SqlValue::Float(left + right as f64).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Number(right)) => Ok(SqlValue::Number(left - right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Float(right)) => Ok(SqlValue::Float(left - right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 - right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Number(right)) => Ok(SqlValue::Float(left - right as f64).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left - right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left - right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Minus, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left as f64 - right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Minus, SqlValue::Number(right)) => {
+            Ok(SqlValue::Float(left - right as f64).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Number(right)) => Ok(SqlValue::Number(left * right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Float(right)) => Ok(SqlValue::Float(left * right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 * right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Number(right)) => Ok(SqlValue::Float(left * right as f64).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left * right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left * right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Multiply, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left as f64 * right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Multiply, SqlValue::Number(right)) => {
+            Ok(SqlValue::Float(left * right as f64).into_expr())
+        }
 
-        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => Err(ExecutionError("Divide by 0 error.".to_string())),
-        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => Err(ExecutionError("Divide by 0 error.".to_string())),
-        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => Err(ExecutionError("Divide by 0 error.".to_string())),
-        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => Err(ExecutionError("Divide by 0 error.".to_string())),
-        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Number(right)) => Ok(SqlValue::Number(left / right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Float(right)) => Ok(SqlValue::Float(left / right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Float(right)) => Ok(SqlValue::Float(left as f64 / right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Number(right)) => Ok(SqlValue::Float(left / right as f64).into_expr()),
+        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => {
+            Err(ExecutionError("Divide by 0 error.".to_string()))
+        }
+        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Number(right)) if right == 0 => {
+            Err(ExecutionError("Divide by 0 error.".to_string()))
+        }
+        (SqlValue::Number(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => {
+            Err(ExecutionError("Divide by 0 error.".to_string()))
+        }
+        (SqlValue::Float(_), BinaryOperator::Divide, SqlValue::Float(right)) if right == 0f64 => {
+            Err(ExecutionError("Divide by 0 error.".to_string()))
+        }
+        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left / right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left / right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Divide, SqlValue::Float(right)) => {
+            Ok(SqlValue::Float(left as f64 / right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Divide, SqlValue::Number(right)) => {
+            Ok(SqlValue::Float(left / right as f64).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::Modulus, SqlValue::Number(right)) => Ok(SqlValue::Number(left % right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Modulus, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left % right).into_expr())
+        }
 
-        (SqlValue::String(left), BinaryOperator::StringConcat, SqlValue::String(right)) => Ok(SqlValue::String(format!("{}{}", left, right)).into_expr()),
+        (SqlValue::String(left), BinaryOperator::StringConcat, SqlValue::String(right)) => {
+            Ok(SqlValue::String(format!("{}{}", left, right)).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 > right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left > right as f64).into_expr()),
-        (SqlValue::String(left), BinaryOperator::Gt, SqlValue::String(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::Gt, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left > right).into_expr()),
-        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left > right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left > right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Gt, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 > right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Gt, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left > right as f64).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::Gt, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left > right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::Gt, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left > right).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Gt, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
         (SqlValue::Number(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Float(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::String(_), BinaryOperator::Gt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
@@ -273,13 +408,27 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Null, BinaryOperator::Gt, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Null, BinaryOperator::Gt, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
 
-        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Float(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Float(right)) => Ok(SqlValue::Bool((left as f64) < right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Number(right)) => Ok(SqlValue::Bool(left < right as f64).into_expr()),
-        (SqlValue::String(left), BinaryOperator::Lt, SqlValue::String(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::Lt, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left < right).into_expr()),
-        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left < right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left < right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Lt, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool((left as f64) < right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Lt, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left < right as f64).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::Lt, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left < right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::Lt, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left < right).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Lt, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
         (SqlValue::Number(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Float(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::String(_), BinaryOperator::Lt, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
@@ -289,44 +438,108 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Null, BinaryOperator::Lt, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Null, BinaryOperator::Lt, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
 
-        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 >= right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left >= right as f64).into_expr()),
-        (SqlValue::String(left), BinaryOperator::GtEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::GtEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left >= right).into_expr()),
-        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
-        (SqlValue::Number(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Float(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::String(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left >= right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left >= right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::GtEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 >= right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::GtEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left >= right as f64).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::GtEq, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left >= right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::GtEq, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left >= right).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Null) => {
+            Ok(SqlValue::Bool(true).into_expr())
+        }
+        (SqlValue::Number(_), BinaryOperator::GtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Float(_), BinaryOperator::GtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::String(_), BinaryOperator::GtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
         (SqlValue::Bool(_), BinaryOperator::GtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Number(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Float(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::GtEq, SqlValue::String(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
         (SqlValue::Null, BinaryOperator::GtEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
 
-        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 <= right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left <= right as f64).into_expr()),
-        (SqlValue::String(left), BinaryOperator::LtEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::LtEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left <= right).into_expr()),
-        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
-        (SqlValue::Number(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Float(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::String(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left <= right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left <= right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::LtEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 <= right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::LtEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left <= right as f64).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::LtEq, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left <= right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::LtEq, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left <= right).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Null) => {
+            Ok(SqlValue::Bool(true).into_expr())
+        }
+        (SqlValue::Number(_), BinaryOperator::LtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Float(_), BinaryOperator::LtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::String(_), BinaryOperator::LtEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
         (SqlValue::Bool(_), BinaryOperator::LtEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Number(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Float(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::LtEq, SqlValue::String(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
         (SqlValue::Null, BinaryOperator::LtEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
 
-        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::String(left), BinaryOperator::Eq, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::Eq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::Eq, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::Eq, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Eq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Eq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right as f64).into_expr())
+        }
         (SqlValue::Number(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Float(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::String(_), BinaryOperator::Eq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
@@ -336,64 +549,150 @@ fn simplify_binary_op(env: &Env, left: Expr, op: BinaryOperator, right: Expr) ->
         (SqlValue::Null, BinaryOperator::Eq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
         (SqlValue::Null, BinaryOperator::Eq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
 
-        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::String(left), BinaryOperator::Spaceship, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::Spaceship, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(true).into_expr()),
-        (SqlValue::Number(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Float(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::String(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Bool(_), BinaryOperator::Spaceship, SqlValue::Null) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Number(_)) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Float(_)) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
-        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Bool(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::Spaceship, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::Spaceship, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::Spaceship, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::Spaceship, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right as f64).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Null) => {
+            Ok(SqlValue::Bool(true).into_expr())
+        }
+        (SqlValue::Number(_), BinaryOperator::Spaceship, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Float(_), BinaryOperator::Spaceship, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::String(_), BinaryOperator::Spaceship, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Bool(_), BinaryOperator::Spaceship, SqlValue::Null) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Number(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Float(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::String(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::Spaceship, SqlValue::Bool(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::String(left), BinaryOperator::NotEq, SqlValue::String(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Bool(left), BinaryOperator::NotEq, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left == right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Float(right)) => Ok(SqlValue::Bool(left as f64 == right).into_expr()),
-        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Number(right)) => Ok(SqlValue::Bool(left == right as f64).into_expr()),
-        (SqlValue::Number(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Float(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::String(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Bool(_), BinaryOperator::NotEq, SqlValue::Null) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Number(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Float(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::String(_)) => Ok(SqlValue::Null.into_expr()),
-        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Bool(_)) => Ok(SqlValue::Null.into_expr()),
+        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::String(left), BinaryOperator::NotEq, SqlValue::String(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Bool(left), BinaryOperator::NotEq, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left == right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::NotEq, SqlValue::Float(right)) => {
+            Ok(SqlValue::Bool(left as f64 == right).into_expr())
+        }
+        (SqlValue::Float(left), BinaryOperator::NotEq, SqlValue::Number(right)) => {
+            Ok(SqlValue::Bool(left == right as f64).into_expr())
+        }
+        (SqlValue::Number(_), BinaryOperator::NotEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Float(_), BinaryOperator::NotEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::String(_), BinaryOperator::NotEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Bool(_), BinaryOperator::NotEq, SqlValue::Null) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Number(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Float(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::String(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
+        (SqlValue::Null, BinaryOperator::NotEq, SqlValue::Bool(_)) => {
+            Ok(SqlValue::Null.into_expr())
+        }
 
-        (SqlValue::Bool(left), BinaryOperator::And, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left && right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::And, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left && right).into_expr())
+        }
 
-        (SqlValue::Bool(left), BinaryOperator::Or, SqlValue::Bool(right)) => Ok(SqlValue::Bool(left || right).into_expr()),
+        (SqlValue::Bool(left), BinaryOperator::Or, SqlValue::Bool(right)) => {
+            Ok(SqlValue::Bool(left || right).into_expr())
+        }
 
-        (SqlValue::String(left), BinaryOperator::Like, SqlValue::String(right)) => simplify_like(left, right, false),
-        (SqlValue::Null, BinaryOperator::Like, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::String(left), BinaryOperator::Like, SqlValue::String(right)) => {
+            simplify_like(left, right, false)
+        }
+        (SqlValue::Null, BinaryOperator::Like, SqlValue::String(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
 
-        (SqlValue::String(left), BinaryOperator::NotLike, SqlValue::String(right)) => simplify_like(left, right, false),
-        (SqlValue::Null, BinaryOperator::NotLike, SqlValue::String(_)) => Ok(SqlValue::Bool(false).into_expr()),
+        (SqlValue::String(left), BinaryOperator::NotLike, SqlValue::String(right)) => {
+            simplify_like(left, right, false)
+        }
+        (SqlValue::Null, BinaryOperator::NotLike, SqlValue::String(_)) => {
+            Ok(SqlValue::Bool(false).into_expr())
+        }
 
-        (SqlValue::Number(left), BinaryOperator::BitwiseOr, SqlValue::Number(right)) => Ok(SqlValue::Number(left | right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::BitwiseAnd, SqlValue::Number(right)) => Ok(SqlValue::Number(left & right).into_expr()),
-        (SqlValue::Number(left), BinaryOperator::BitwiseXor, SqlValue::Number(right)) => Ok(SqlValue::Number(left ^ right).into_expr()),
+        (SqlValue::Number(left), BinaryOperator::BitwiseOr, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left | right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::BitwiseAnd, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left & right).into_expr())
+        }
+        (SqlValue::Number(left), BinaryOperator::BitwiseXor, SqlValue::Number(right)) => {
+            Ok(SqlValue::Number(left ^ right).into_expr())
+        }
 
-        (left, op, right) => Err(ExecutionError(format!("Unsupported binary operation: {} {} {}", left, op, right))),
+        (left, op, right) => Err(ExecutionError(format!(
+            "Unsupported binary operation: {} {} {}",
+            left, op, right
+        ))),
     }
 }
 
+// Very simplistic implementation.
 fn simplify_like(left: String, right: String, negated: bool) -> Result<Expr, ExecutionError> {
     let (tpe, content) = parse_like_expr(right)?;
 
     match tpe {
-        Like::StartWith => Ok(SqlValue::Bool(!negated && left.starts_with(content.as_str())).into_expr()),
-        Like::EndWith => Ok(SqlValue::Bool(!negated && left.ends_with(content.as_str())).into_expr()),
-        Like::Contains => Ok(SqlValue::Bool(!negated &&  left.contains(content.as_str())).into_expr()),
+        Like::StartWith => {
+            Ok(SqlValue::Bool(!negated && left.starts_with(content.as_str())).into_expr())
+        }
+        Like::EndWith => {
+            Ok(SqlValue::Bool(!negated && left.ends_with(content.as_str())).into_expr())
+        }
+        Like::Contains => {
+            Ok(SqlValue::Bool(!negated && left.contains(content.as_str())).into_expr())
+        }
     }
- }
+}
 
 #[derive(Clone)]
 enum Like {
@@ -433,11 +732,20 @@ fn parse_like_expr(input: String) -> Result<(Like, String), ExecutionError> {
         return Ok((Like::StartWith, content));
     }
 
-    Err(ExecutionError(format!("Malformed (NOT) LIKE expression: {}", input)))
+    Err(ExecutionError(format!(
+        "Malformed (NOT) LIKE expression: {}",
+        input
+    )))
 }
 
-fn simplify_unary_op(env: &Env, op: UnaryOperator, expr: Expr) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(env, expr)?;
+async fn simplify_unary_op(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    op: UnaryOperator,
+    expr: Expr,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
     let expr = collect_sql_value(&expr)?;
 
     match (op, expr) {
@@ -449,12 +757,20 @@ fn simplify_unary_op(env: &Env, op: UnaryOperator, expr: Expr) -> Result<Expr, E
 
         (UnaryOperator::Not, SqlValue::Bool(boolean)) => Ok(SqlValue::Bool(!boolean).into_expr()),
 
-        (op, expr) => Err(ExecutionError(format!("Unsupported unary operation: {} {}", op, expr))),
+        (op, expr) => Err(ExecutionError(format!(
+            "Unsupported unary operation: {} {}",
+            op, expr
+        ))),
     }
 }
 
-fn simplify_is_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(env, expr)?;
+async fn simplify_is_null(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
     let expr = collect_sql_value(&expr)?;
 
     match expr {
@@ -463,8 +779,13 @@ fn simplify_is_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
     }
 }
 
-fn simplify_is_not_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(env, expr)?;
+async fn simplify_is_not_null(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
     let expr = collect_sql_value(&expr)?;
 
     match expr {
@@ -473,23 +794,40 @@ fn simplify_is_not_null(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
     }
 }
 
-fn simplify_between(env: &Env, expr: Expr, negated: bool, low: Expr, high: Expr) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(env, expr)?;
-    let low = simplify_expr(env, low)?;
-    let high = simplify_expr(env, high)?;
+async fn simplify_between(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+    negated: bool,
+    low: Expr,
+    high: Expr,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
+    let low = simplify_expr(stack, client, env, low).await?;
+    let high = simplify_expr(stack, client, env, high).await?;
     let expr = collect_sql_value(&expr)?;
     let low = collect_sql_value(&low)?;
     let high = collect_sql_value(&high)?;
 
     let result = match (expr, low, high) {
-        (SqlValue::Number(value), SqlValue::Number(low), SqlValue::Number(high)) => Ok(value >= low && value <= high),
-        (SqlValue::Float(value), SqlValue::Float(low), SqlValue::Float(high)) => Ok(value >= low && value <= high),
-        (SqlValue::String(value), SqlValue::String(low), SqlValue::String(high)) => Ok(value >= low && value <= high),
+        (SqlValue::Number(value), SqlValue::Number(low), SqlValue::Number(high)) => {
+            Ok(value >= low && value <= high)
+        }
+        (SqlValue::Float(value), SqlValue::Float(low), SqlValue::Float(high)) => {
+            Ok(value >= low && value <= high)
+        }
+        (SqlValue::String(value), SqlValue::String(low), SqlValue::String(high)) => {
+            Ok(value >= low && value <= high)
+        }
 
         (expr, low, high) => {
             let negate_str = if negated { "NOT" } else { "" };
 
-            Err(ExecutionError(format!("Invalid between arguments: {} {} BETWEEN {} AND  {}", expr, negate_str, low, high)))
+            Err(ExecutionError(format!(
+                "Invalid between arguments: {} {} BETWEEN {} AND  {}",
+                expr, negate_str, low, high
+            )))
         }
     }?;
 
@@ -498,13 +836,20 @@ fn simplify_between(env: &Env, expr: Expr, negated: bool, low: Expr, high: Expr)
     Ok(SqlValue::Bool(result).into_expr())
 }
 
-fn simplify_in_list(env: &Env, expr: Expr, list: Vec<Expr>, negated: bool) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(env, expr)?;
+async fn simplify_in_list(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+    list: Vec<Expr>,
+    negated: bool,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
     let expr = collect_sql_value(&expr)?;
     let mut result = false;
 
     for elem_expr in list {
-        let elem_expr = simplify_expr(env, elem_expr)?;
+        let elem_expr = simplify_expr(stack, client, env, elem_expr).await?;
         let elem_expr = collect_sql_value(&elem_expr)?;
 
         if !expr.is_same_type(&elem_expr) {
@@ -550,18 +895,109 @@ fn simplify_in_list(env: &Env, expr: Expr, list: Vec<Expr>, negated: bool) -> Re
     Ok(SqlValue::Bool(result).into_expr())
 }
 
-fn simplify_nested(env: &Env, expr: Expr) -> Result<Expr, ExecutionError> {
-    Ok(simplify_expr(env, expr)?)
+async fn simplify_nested(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+) -> Result<Expr, ExecutionError> {
+    Ok(simplify_expr(stack, client, env, expr).await?)
 }
 
-fn execute_predicate(env: &Env, predicate_expr: &Expr) -> Result<bool, ExecutionError> {
-    let expr = simplify_expr(env, predicate_expr.clone())?;
+async fn simplify_subquery(
+    stack: &mut Stack,
+    client: &eventstore::Client,
+    env: &Env,
+    expr: Expr,
+    subquery: Query,
+    negated: bool,
+) -> Result<Expr, ExecutionError> {
+    let expr = simplify_expr(stack, client, env, expr).await?;
+    let expr = collect_sql_value(&expr)?;
+    let plan = if let Some(p) = build_plan_from_query(subquery) {
+        Ok(p)
+    } else {
+        Err(ExecutionError(
+            "Unable to build a successful build plan out of the subquery".to_string(),
+        ))
+    }?;
+
+    let mut stream = match execute_plan(client, plan).await {
+        Ok(s) => Ok(s),
+        Err(e) => Err(ExecutionError(format!(
+            "Error when executing sub query: {}",
+            e
+        ))),
+    }?;
+
+    let mut result = false;
+
+    loop {
+        match stream.try_next().await {
+            Err(e) => {
+                return Err(ExecutionError(format!(
+                    "Error when consuming sub query stream: {}",
+                    e
+                )));
+            }
+
+            Ok(value) => {
+                if let Some(value) = value {
+                    let sql_value = collect_json_literal(&value)?;
+
+                    if !expr.is_same_type(&sql_value) {
+                        return Err(ExecutionError(format!(
+                            "Unexpected type in subquery: {} (NOT) IN {}",
+                            value, sql_value
+                        )));
+                    }
+
+                    match (&expr, sql_value) {
+                        (SqlValue::String(ref left), SqlValue::String(right))
+                            if left.as_str() == right.as_str() =>
+                        {
+                            result = true;
+                            break;
+                        }
+
+                        (SqlValue::Number(ref left), SqlValue::Number(right)) if *left == right => {
+                            result = true;
+                            break;
+                        }
+
+                        (SqlValue::Float(ref left), SqlValue::Float(right)) if *left == right => {
+                            result = true;
+                            break;
+                        }
+
+                        _ => continue,
+                    }
+                }
+
+                break;
+            }
+        }
+    }
+
+    Ok(SqlValue::Bool(!negated && result).into_expr())
+}
+
+async fn execute_predicate(
+    client: &eventstore::Client,
+    env: &Env,
+    predicate_expr: &Expr,
+) -> Result<bool, ExecutionError> {
+    let mut stack = Stack::new();
+    let expr = simplify_expr(&mut stack, client, env, predicate_expr.clone()).await?;
     let expr = collect_sql_value(&expr)?;
 
     match expr {
         SqlValue::Bool(value) => Ok(value),
         SqlValue::Null => Ok(false),
-        expr => Err(ExecutionError(format!("Where predicate was not a boolean, got: {}", expr))),
+        expr => Err(ExecutionError(format!(
+            "Where predicate was not a boolean, got: {}",
+            expr
+        ))),
     }
 }
 
@@ -569,10 +1005,9 @@ fn resolve_name(env: &Env, name: String) -> Result<SqlValue, ExecutionError> {
     if let Some(value) = env.get(&name) {
         return collect_json_literal(value);
     }
-    
+
     Ok(SqlValue::Null)
 }
-
 
 fn collect_json_literal(value: &serde_json::Value) -> Result<SqlValue, ExecutionError> {
     match value {
@@ -595,7 +1030,10 @@ fn collect_json_literal(value: &serde_json::Value) -> Result<SqlValue, Execution
             Ok(SqlValue::Float(value.as_f64().expect("to be f64")))
         }
 
-        unsupported => Err(ExecutionError(format!("Unsupported JSON to SQL value conversion: {:?}", unsupported))),
+        unsupported => Err(ExecutionError(format!(
+            "Unsupported JSON to SQL value conversion: {:?}",
+            unsupported
+        ))),
     }
 }
 
@@ -613,13 +1051,19 @@ fn collect_value(value: &sqlparser::ast::Value) -> Result<SqlValue, ExecutionErr
             if *is_long {
                 return match value.parse::<i64>() {
                     Ok(value) => Ok(SqlValue::Number(value)),
-                    Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
-                }
+                    Err(e) => Err(ExecutionError(format!(
+                        "Invalid number value format: {}",
+                        e
+                    ))),
+                };
             }
 
             match value.parse::<f64>() {
                 Ok(value) => Ok(SqlValue::Float(value)),
-                Err(e) => Err(ExecutionError(format!("Invalid number value format: {}", e)))
+                Err(e) => Err(ExecutionError(format!(
+                    "Invalid number value format: {}",
+                    e
+                ))),
             }
         }
 
