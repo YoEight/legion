@@ -158,7 +158,7 @@ pub async fn execute_plan<'a>(
                 let mut line = HashMap::new();
 
                 if let Some(expr) = plan.predicate.as_ref() {
-                    let passed = execute_predicate(client, &json_payload, expr).await?;
+                    let passed = execute_predicate(client, json_payload.clone(), expr.clone()).await?;
 
                     if !passed {
                         continue;
@@ -336,7 +336,7 @@ enum StackElem {
 async fn simplify_expr(
     stack: &mut Stack,
     client: &eventstore::Client,
-    env: &Env,
+    env: Env,
     expr: Expr,
 ) -> Result<Expr, ExecutionError> {
     let mut params = Vec::<SqlValue>::new();
@@ -353,7 +353,7 @@ async fn simplify_expr(
 
             StackElem::Expr(expr) => match expr {
                 Expr::Identifier(ident) => {
-                    let value = resolve_name(env, ident.value)?;
+                    let value = resolve_name(&env, ident.value)?;
 
                     stack.push(StackElem::Value(value));
                 }
@@ -370,7 +370,7 @@ async fn simplify_expr(
                         }
                     }
 
-                    let value = resolve_name(env, ident)?;
+                    let value = resolve_name(&env, ident)?;
 
                     stack.push(StackElem::Value(value));
                 }
@@ -434,8 +434,9 @@ async fn simplify_expr(
                     subquery,
                     negated,
                 } => {
+                    let expr = *expr;
+
                     stack.push(StackElem::InSubquery(negated));
-                    stack.push(StackElem::Expr(*expr));
 
                     let plan = if let Some(p) = build_plan_from_query(*subquery) {
                         Ok(p)
@@ -460,7 +461,25 @@ async fn simplify_expr(
                         }
 
                         Ok(stream) => {
-                            if let Some(stream) = stream.ok() {}
+                            if let Some(mut stream) = stream.ok() {
+                                loop {
+                                    match stream.try_next().await {
+                                        Err(e) => return Err(ExecutionError(format!("Unexpected error when consuming subquery: {}", e))),
+                                        Ok(elem) => {
+                                            if let Some(elem) = elem {
+                                                let new_env = create_env(&plan, elem.get_original_event())?;
+                                                let mut new_stack = Stack::new();
+
+                                                new_stack.push(StackElem::Return);
+                                                new_stack.push(StackElem::Expr(expr.clone()));
+                                                continue;
+                                            }
+
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
 
                             return Err(ExecutionError(format!(
                                 "stream mentioned in subquery doesn't not exist: {}",
@@ -868,91 +887,13 @@ fn parse_like_expr(input: String) -> Result<(Like, String), ExecutionError> {
     )))
 }
 
-async fn simplify_subquery(
-    stack: &mut Stack,
-    client: &eventstore::Client,
-    env: &Env,
-    expr: Expr,
-    subquery: Query,
-    negated: bool,
-) -> Result<Expr, ExecutionError> {
-    let expr = simplify_expr(stack, client, env, expr).await?;
-    let expr = collect_sql_value(&expr)?;
-    let plan = if let Some(p) = build_plan_from_query(subquery) {
-        Ok(p)
-    } else {
-        Err(ExecutionError(
-            "Unable to build a successful build plan out of the subquery".to_string(),
-        ))
-    }?;
-
-    let mut stream = match execute_plan(client, plan).await {
-        Ok(s) => Ok(s),
-        Err(e) => Err(ExecutionError(format!(
-            "Error when executing sub query: {}",
-            e
-        ))),
-    }?;
-
-    let mut result = false;
-
-    loop {
-        match stream.try_next().await {
-            Err(e) => {
-                return Err(ExecutionError(format!(
-                    "Error when consuming sub query stream: {}",
-                    e
-                )));
-            }
-
-            Ok(value) => {
-                if let Some(value) = value {
-                    let sql_value = collect_json_literal(&value)?;
-
-                    if !expr.is_same_type(&sql_value) {
-                        return Err(ExecutionError(format!(
-                            "Unexpected type in subquery: {} (NOT) IN {}",
-                            value, sql_value
-                        )));
-                    }
-
-                    match (&expr, sql_value) {
-                        (SqlValue::String(ref left), SqlValue::String(right))
-                            if left.as_str() == right.as_str() =>
-                        {
-                            result = true;
-                            break;
-                        }
-
-                        (SqlValue::Number(ref left), SqlValue::Number(right)) if *left == right => {
-                            result = true;
-                            break;
-                        }
-
-                        (SqlValue::Float(ref left), SqlValue::Float(right)) if *left == right => {
-                            result = true;
-                            break;
-                        }
-
-                        _ => continue,
-                    }
-                }
-
-                break;
-            }
-        }
-    }
-
-    Ok(SqlValue::Bool(!negated && result).into_expr())
-}
-
 async fn execute_predicate(
     client: &eventstore::Client,
-    env: &Env,
-    predicate_expr: &Expr,
+    env: Env,
+    predicate_expr: Expr,
 ) -> Result<bool, ExecutionError> {
     let mut stack = Stack::new();
-    let expr = simplify_expr(&mut stack, client, env, predicate_expr.clone()).await?;
+    let expr = simplify_expr(&mut stack, client, env, predicate_expr).await?;
     let expr = collect_sql_value(&expr)?;
 
     match expr {
