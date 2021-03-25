@@ -707,6 +707,7 @@ dependencies = [
  "clap",
  "eventstore",
  "futures",
+ "log",
  "nom 6.1.2",
  "pretty_env_logger",
  "reqwest",
