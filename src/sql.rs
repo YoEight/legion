@@ -225,18 +225,18 @@ impl std::fmt::Display for SqlValue {
     }
 }
 
-struct Stack(Vec<Expr>);
+struct Stack(Vec<StackElem>);
 
 impl Stack {
     fn new() -> Self {
         Stack(Vec::new())
     }
 
-    fn push(&mut self, expr: Expr) {
+    fn push(&mut self, expr: StackElem) {
         self.0.push(expr);
     }
 
-    fn pop(&mut self) -> Result<Expr, ExecutionError> {
+    fn pop(&mut self) -> Result<StackElem, ExecutionError> {
         if let Some(expr) = self.0.pop() {
             return Ok(expr);
         }
@@ -245,48 +245,196 @@ impl Stack {
     }
 }
 
+enum StackElem {
+    BinaryOp(BinaryOperator),
+    UnaryOp(UnaryOperator),
+    IsNull(bool),
+    InList(bool),
+    InSubquery(bool),
+    Between(bool),
+    Value(SqlValue),
+    Expr(Expr),
+    Return,
+}
+
 async fn simplify_expr(
     stack: &mut Stack,
     client: &eventstore::Client,
     env: &Env,
     expr: Expr,
 ) -> Result<Expr, ExecutionError> {
+    let mut params = Vec::<SqlValue>::new();
 
-    loop {}
+    // Initiate the execution loop.
+    stack.push(StackElem::Return);
+    stack.push(StackElem::Expr(expr));
 
-    match expr {
-        Expr::Identifier(ident) => {
-            let value = resolve_name(env, ident.value)?;
+    loop {
+        match stack.pop()? {
+            StackElem::Return => return Ok(params.pop().unwrap().into_expr()),
+            StackElem::Value(value) => params.push(value),
 
-            Ok(value.into_expr())
+            StackElem::Expr(expr) => match expr {
+                Expr::Identifier(ident) => {
+                    let value = resolve_name(env, ident.value)?;
+
+                    stack.push(StackElem::Value(value));
+                }
+
+                Expr::BinaryOp { left, op, right } => {
+                    stack.push(StackElem::BinaryOp(op));
+                    stack.push(StackElem::Expr(*right));
+                    stack.push(StackElem::Expr(*left));
+                }
+
+                Expr::UnaryOp { op, expr } => {
+                    stack.push(StackElem::UnaryOp(op));
+                    stack.push(StackElem::Expr(*expr));
+                }
+
+                Expr::IsNull(expr) => {
+                    stack.push(StackElem::IsNull(false));
+                    stack.push(StackElem::Expr(*expr));
+                }
+
+                Expr::IsNotNull(expr) => {
+                    stack.push(StackElem::IsNull(true));
+                    stack.push(StackElem::Expr(*expr));
+                }
+
+                Expr::Between {
+                    expr,
+                    negated,
+                    low,
+                    high,
+                } => {
+                    stack.push(StackElem::Between(negated));
+                    stack.push(StackElem::Expr(*high));
+                    stack.push(StackElem::Expr(*low));
+                    stack.push(StackElem::Expr(*expr));
+                }
+
+                Expr::InList {
+                    expr,
+                    list,
+                    negated,
+                } => {
+                    stack.push(StackElem::InList(negated));
+                    stack.push(StackElem::Expr(*expr));
+
+                    for elem in list {
+                        stack.push(StackElem::Expr(elem));
+                    }
+                }
+
+                Expr::Nested(expr) => {
+                    stack.push(StackElem::Expr(*expr));
+                }
+
+                Expr::InSubquery { .. } => {
+                    unimplemented!()
+                }
+
+                expr => return Err(ExecutionError(format!("Unsupported expression: {}", expr))),
+            },
+
+            StackElem::IsNull(negated) => {
+                let result = if let SqlValue::Null = params.pop().unwrap() {
+                    true
+                } else {
+                    false
+                };
+
+                stack.push(StackElem::Value(SqlValue::Bool(!negated && result)));
+            }
+
+            StackElem::InList(negated) => {
+                let mut result = false;
+                let expr = params.pop().unwrap();
+
+                while let Some(elem) = params.pop() {
+                    if !expr.is_same_type(&elem) {
+                        return Err(ExecutionError("IN LIST operation contains elements that have a different time than target expression".to_string()));
+                    }
+
+                    match (&expr, elem) {
+                        (SqlValue::Number(ref x), SqlValue::Number(y)) => {
+                            if *x == y {
+                                result = true;
+                                break;
+                            }
+                        }
+
+                        (SqlValue::Float(ref x), SqlValue::Float(y)) => {
+                            // We all know doing equality checks over floats is stupid but it is what it is.
+                            if *x == y {
+                                result = true;
+                                break;
+                            }
+                        }
+
+                        (SqlValue::String(ref x), SqlValue::String(ref y)) => {
+                            if x == y {
+                                result = true;
+                                break;
+                            }
+                        }
+
+                        (SqlValue::Bool(ref x), SqlValue::Bool(y)) => {
+                            if *x == y {
+                                result = true;
+                                break;
+                            }
+                        }
+
+                        _ => unreachable!(),
+                    }
+                }
+
+                stack.push(StackElem::Value(SqlValue::Bool(!negated && result)));
+            }
+
+            _ => break,
         }
-
-        Expr::BinaryOp { left, op, right } => {
-            simplify_binary_op(stack, client, env, *left, op, *right).await
-        }
-        Expr::UnaryOp { op, expr } => simplify_unary_op(stack, client, env, op, *expr).await,
-        Expr::IsNull(expr) => simplify_is_null(stack, client, env, *expr).await,
-        Expr::IsNotNull(expr) => simplify_is_not_null(stack, client, env, *expr).await,
-        Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => simplify_between(stack, client, env, *expr, negated, *low, *high).await,
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => simplify_in_list(stack, client, env, *expr, list, negated).await,
-        Expr::Nested(expr) => simplify_nested(stack, client, env, *expr).await,
-        Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => simplify_subquery(stack, client, env, *expr, *subquery, negated).await,
-
-        expr => Ok(expr),
     }
+
+    // match expr {
+    //     Expr::Identifier(ident) => {
+    //         let value = resolve_name(env, ident.value)?;
+
+    //         Ok(value.into_expr())
+    //     }
+
+    //     Expr::BinaryOp { left, op, right } => {
+    //         simplify_binary_op(stack, client, env, *left, op, *right).await
+    //     }
+    //     Expr::UnaryOp { op, expr } => simplify_unary_op(stack, client, env, op, *expr).await,
+    //     Expr::IsNull(expr) => simplify_is_null(stack, client, env, *expr).await,
+    //     Expr::IsNotNull(expr) => simplify_is_not_null(stack, client, env, *expr).await,
+    //     Expr::Between {
+    //         expr,
+    //         negated,
+    //         low,
+    //         high,
+    //     } => simplify_between(stack, client, env, *expr, negated, *low, *high).await,
+    //     Expr::InList {
+    //         expr,
+    //         list,
+    //         negated,
+    //     } => simplify_in_list(stack, client, env, *expr, list, negated).await,
+    //     Expr::Nested(expr) => simplify_nested(stack, client, env, *expr).await,
+    //     Expr::InSubquery {
+    //         expr,
+    //         subquery,
+    //         negated,
+    //     } => simplify_subquery(stack, client, env, *expr, *subquery, negated).await,
+
+    //     expr => Ok(expr),
+    // }
+
+    Err(ExecutionError(
+        "Error when evaluating SQL expression".to_string(),
+    ))
 }
 
 async fn simplify_binary_op(
