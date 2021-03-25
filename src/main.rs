@@ -200,7 +200,7 @@ async fn main() -> crate::Result<()> {
                 }
 
                 crate::input::Command::SqlQuery(stmts) => {
-                    //println!("\nDEBUG: {:?}", stmts);
+                    debug!("\n: {:?}", stmts);
                     let plan = sql::build_plan(stmts);
                     if let Some(plan) = plan {
                         let mut stream = sql::execute_plan(&es_client, plan).await?;

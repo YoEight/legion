@@ -12,6 +12,7 @@ use std::ops::RangeFrom;
 #[derive(Debug)]
 pub struct Plan {
     stream_name: String,
+    alias: Option<String>,
     count: usize,
     fields: Vec<String>,
     predicate: Option<Expr>,
@@ -21,6 +22,7 @@ impl Default for Plan {
     fn default() -> Self {
         Self {
             stream_name: "".to_string(),
+            alias: None,
             count: usize::MAX,
             fields: Vec::new(),
             predicate: None,
@@ -38,23 +40,95 @@ pub fn build_plan(mut stmts: Vec<sqlparser::ast::Statement>) -> Option<Plan> {
     None
 }
 
+fn create_env(plan: &Plan, event: &eventstore::RecordedEvent) -> Result<Env, ExecutionError> {
+    match serde_json::from_slice::<Env>(event.data.as_ref()) {
+        Err(e) => Err(ExecutionError(format!(
+            "Error when parsing event payload to JSON: {}",
+            e
+        ))),
+        Ok(mut env) => {
+            let mut prefix = String::new();
+
+            if let Some(alias) = plan.alias.as_ref() {
+                let mut tmp = HashMap::new();
+                for (key, value) in env.drain() {
+                    tmp.insert(format!("{}.{}", alias, key), value);
+                }
+
+                env = tmp;
+                prefix = format!("{}.", alias);
+            }
+
+            env.insert(
+                format!("{}es_type", prefix),
+                serde_json::to_value(event.event_type.as_str()).expect("valid json"),
+            );
+            env.insert(
+                format!("{}es_stream_id", prefix),
+                serde_json::to_value(event.stream_id.as_str()).expect("valid json"),
+            );
+            env.insert(
+                format!("{}es_event_id", prefix),
+                serde_json::to_value(event.id.to_string()).expect("valid json"),
+            );
+            env.insert(
+                format!("{}es_revision", prefix),
+                serde_json::to_value(&event.revision).expect("valid json"),
+            );
+            env.insert(
+                format!("{}es_commit", prefix),
+                serde_json::to_value(&event.position.commit).expect("valid json"),
+            );
+            env.insert(
+                format!("{}es_prepare", prefix),
+                serde_json::to_value(&event.position.prepare).expect("valid json"),
+            );
+
+            Ok(env)
+        }
+    }
+}
+
 pub fn build_plan_from_query(query: Query) -> Option<Plan> {
     let mut plan = Plan::default();
     if let sqlparser::ast::SetExpr::Select(mut select) = query.body {
         for item in select.projection {
             if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = item {
-                if let sqlparser::ast::Expr::Identifier(ident) = expr {
-                    plan.fields.push(ident.value);
+                match expr {
+                    Expr::Identifier(ident) => {
+                        plan.fields.push(ident.value);
+                    }
+
+                    Expr::CompoundIdentifier(idents) => {
+                        let mut ident = String::new();
+
+                        for elem in idents {
+                            if ident.is_empty() {
+                                ident.push_str(elem.value.as_str());
+                            } else {
+                                ident.push('.');
+                                ident.push_str(elem.value.as_str());
+                            }
+                        }
+
+                        plan.fields.push(ident);
+                    }
+
+                    _ => {}
                 }
             }
         }
 
         let from = select.from.pop()?;
 
-        if let sqlparser::ast::TableFactor::Table { mut name, .. } = from.relation {
+        if let sqlparser::ast::TableFactor::Table {
+            mut name, alias, ..
+        } = from.relation
+        {
             let name = name.0.pop()?;
 
             plan.stream_name = name.value;
+            plan.alias = alias.map(|a| a.name.value);
         }
 
         plan.predicate = select.selection;
@@ -80,15 +154,8 @@ pub async fn execute_plan<'a>(
             while let Ok(Some(event)) = stream.try_next().await {
                 let event = event.get_original_event();
 
-                let mut json_payload = serde_json::from_slice::<HashMap<String, serde_json::Value>>(event.data.as_ref()).unwrap();
+                let mut json_payload = create_env(&plan, event)?;
                 let mut line = HashMap::new();
-
-                json_payload.insert("es_type".to_string(), serde_json::to_value(event.event_type.as_str()).expect("valid json"));
-                json_payload.insert("es_stream_id".to_string(), serde_json::to_value(event.stream_id.as_str()).expect("valid json"));
-                json_payload.insert("es_event_id".to_string(), serde_json::to_value(event.id.to_string()).expect("valid json"));
-                json_payload.insert("es_revision".to_string(), serde_json::to_value(&event.revision).expect("valid json"));
-                json_payload.insert("es_commit".to_string(), serde_json::to_value(&event.position.commit).expect("valid json"));
-                json_payload.insert("es_prepare".to_string(), serde_json::to_value(&event.position.prepare).expect("valid json"));
 
                 if let Some(expr) = plan.predicate.as_ref() {
                     let passed = execute_predicate(client, &json_payload, expr).await?;
@@ -291,6 +358,23 @@ async fn simplify_expr(
                     stack.push(StackElem::Value(value));
                 }
 
+                Expr::CompoundIdentifier(idents) => {
+                    let mut ident = String::new();
+
+                    for elem in idents {
+                        if ident.is_empty() {
+                            ident.push_str(elem.value.as_str());
+                        } else {
+                            ident.push('.');
+                            ident.push_str(elem.value.as_str());
+                        }
+                    }
+
+                    let value = resolve_name(env, ident)?;
+
+                    stack.push(StackElem::Value(value));
+                }
+
                 Expr::Value(value) => {
                     stack.push(StackElem::Value(collect_value(&value)?));
                 }
@@ -345,8 +429,45 @@ async fn simplify_expr(
                     stack.push(StackElem::Expr(*expr));
                 }
 
-                Expr::InSubquery { .. } => {
-                    unimplemented!()
+                Expr::InSubquery {
+                    expr,
+                    subquery,
+                    negated,
+                } => {
+                    stack.push(StackElem::InSubquery(negated));
+                    stack.push(StackElem::Expr(*expr));
+
+                    let plan = if let Some(p) = build_plan_from_query(*subquery) {
+                        Ok(p)
+                    } else {
+                        Err(ExecutionError(
+                            "Unable to make a build plan out of the subquery".to_string(),
+                        ))
+                    }?;
+
+                    let stream = client
+                        .read_stream(plan.stream_name.as_str())
+                        .start_from_beginning()
+                        .read_through()
+                        .await;
+
+                    match stream {
+                        Err(e) => {
+                            return Err(ExecutionError(format!(
+                                "Error when execution subquery: {}",
+                                e
+                            )));
+                        }
+
+                        Ok(stream) => {
+                            if let Some(stream) = stream.ok() {}
+
+                            return Err(ExecutionError(format!(
+                                "stream mentioned in subquery doesn't not exist: {}",
+                                plan.stream_name.as_str()
+                            )));
+                        }
+                    }
                 }
 
                 expr => return Err(ExecutionError(format!("Unsupported expression: {}", expr))),
