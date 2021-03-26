@@ -16,6 +16,23 @@ pub struct Plan {
     count: usize,
     fields: Vec<String>,
     predicate: Option<Expr>,
+    joins: Vec<Join>,
+}
+
+#[derive(Debug)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+#[derive(Debug)]
+pub struct Join {
+    name: String,
+    alias: Option<String>,
+    join_type: JoinType,
+    join_expr: Expr,
 }
 
 impl Default for Plan {
@@ -26,6 +43,7 @@ impl Default for Plan {
             count: usize::MAX,
             fields: Vec::new(),
             predicate: None,
+            joins: Vec::new(),
         }
     }
 }
@@ -151,12 +169,48 @@ pub fn build_plan_from_query(query: Query) -> Option<Plan> {
             plan.alias = alias.map(|a| a.name.value);
         }
 
+        let mut joins = Vec::new();
+        for join in from.joins {
+            if let sqlparser::ast::TableFactor::Table {
+                mut name, alias, ..
+            } = join.relation
+            {
+                let name = name.0.pop().expect("non empty ident list").value;
+                let alias = alias.map(|a| a.name.value);
+
+               let (join_type, expr) = match join.join_operator {
+                   sqlparser::ast::JoinOperator::Inner(expr) => (JoinType::Inner, join_operator_expr(expr)?),
+                   sqlparser::ast::JoinOperator::LeftOuter(expr) => (JoinType::Left, join_operator_expr(expr)?),
+                   sqlparser::ast::JoinOperator::RightOuter(expr) => (JoinType::Right, join_operator_expr(expr)?),
+                   sqlparser::ast::JoinOperator::FullOuter(expr) => (JoinType::Full, join_operator_expr(expr)?),
+                   _ => return None,
+               };
+
+                let join = Join {
+                    name,
+                    alias,
+                    join_type,
+                    join_expr: expr,
+                };
+
+                joins.push(join);
+            }
+        }
+
         plan.predicate = select.selection;
 
         return Some(plan);
     }
 
     None
+}
+
+fn join_operator_expr(constraint: sqlparser::ast::JoinConstraint) -> Option<Expr> {
+    if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
+        Some(expr)
+    } else {
+        None
+    }
 }
 
 pub async fn execute_plan<'a>(
@@ -927,7 +981,9 @@ async fn simplify_expr(
                                 continue;
                             }
 
-                            (SqlValue::Float(ref expr), SqlValue::Float(field)) if *expr == field => {
+                            (SqlValue::Float(ref expr), SqlValue::Float(field))
+                                if *expr == field =>
+                            {
                                 stack.push(StackElem::Value(SqlValue::Bool(!negated)));
                                 continue;
                             }
@@ -994,28 +1050,6 @@ async fn simplify_expr(
                 }
             }
         }
-    }
-}
-
-fn is_comparison_operator(op: &BinaryOperator) -> bool {
-    match op {
-        BinaryOperator::Eq => true,
-        BinaryOperator::NotEq => true,
-        BinaryOperator::Gt => true,
-        BinaryOperator::Lt => true,
-        BinaryOperator::GtEq => true,
-        BinaryOperator::LtEq => true,
-        _ => false,
-    }
-}
-
-fn is_algebraic_operator(op: &BinaryOperator) -> bool {
-    match op {
-        BinaryOperator::Plus => true,
-        BinaryOperator::Minus => true,
-        BinaryOperator::Multiply => true,
-        BinaryOperator::Divide => true,
-        _ => false,
     }
 }
 
