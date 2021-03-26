@@ -1,6 +1,6 @@
 use core::pin::Pin;
 use futures::stream::BoxStream;
-use futures::{Future, TryStreamExt};
+use futures::{Future, Stream, TryStreamExt};
 use nom::character::complete::{anychar, char, satisfy};
 use nom::combinator::{flat_map, opt, success};
 use nom::multi::fold_many1;
@@ -320,26 +320,56 @@ impl Stack {
     }
 }
 
-#[derive(Debug)]
 enum StackElem {
     BinaryOp(BinaryOperator),
     UnaryOp(UnaryOperator),
     IsNull(bool),
     InList(bool),
-    InSubquery(bool),
+    InSubquery {
+        plan: Plan,
+        negated: bool,
+        stream: Box<
+            dyn Stream<Item = Result<eventstore::ResolvedEvent, eventstore::Error>> + Send + Unpin,
+        >,
+    },
     Between(bool),
     Value(SqlValue),
     Expr(Expr),
     Return,
 }
 
+impl std::fmt::Debug for StackElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StackElem::BinaryOp(ref op) => write!(f, "BinaryOp({:?})", op),
+            StackElem::UnaryOp(ref op) => write!(f, "UnaryOp({:?})", op),
+            StackElem::IsNull(ref op) => write!(f, "IsNull({:?})", op),
+            StackElem::InList(ref op) => write!(f, "IsList({:?})", op),
+            StackElem::InSubquery {
+                ref plan,
+                ref negated,
+                ..
+            } => write!(
+                f,
+                "InSubquery{{ plan: {:?}, negated: {:?}, *stream* }})",
+                plan, negated
+            ),
+            StackElem::Between(ref op) => write!(f, "Between({:?})", op),
+            StackElem::Value(ref op) => write!(f, "Value({:?})", op),
+            StackElem::Expr(ref op) => write!(f, "Expr({:?})", op),
+            StackElem::Return => write!(f, "Return"),
+        }
+    }
+}
+
 async fn simplify_expr(
     stack: &mut Stack,
     client: &eventstore::Client,
-    env: Env,
+    mut env: Env,
     expr: Expr,
 ) -> Result<Expr, ExecutionError> {
     let mut params = Vec::<SqlValue>::new();
+    let mut scopes = Vec::<Env>::new();
 
     // Initiate the execution loop.
     stack.push(StackElem::Return);
@@ -348,7 +378,17 @@ async fn simplify_expr(
     loop {
         debug!("Stack: {:?}", stack);
         match stack.pop()? {
-            StackElem::Return => return Ok(params.pop().unwrap().into_expr()),
+            StackElem::Return => {
+                if let Some(prev_env) = scopes.pop() {
+                    env = prev_env;
+                    stack.push(StackElem::Value(params.pop().unwrap()));
+
+                    continue;
+                }
+
+                return Ok(params.pop().unwrap().into_expr());
+            }
+
             StackElem::Value(value) => params.push(value),
 
             StackElem::Expr(expr) => match expr {
@@ -434,10 +474,6 @@ async fn simplify_expr(
                     subquery,
                     negated,
                 } => {
-                    let expr = *expr;
-
-                    stack.push(StackElem::InSubquery(negated));
-
                     let plan = if let Some(p) = build_plan_from_query(*subquery) {
                         Ok(p)
                     } else {
@@ -462,21 +498,57 @@ async fn simplify_expr(
 
                         Ok(stream) => {
                             if let Some(mut stream) = stream.ok() {
-                                loop {
-                                    match stream.try_next().await {
-                                        Err(e) => return Err(ExecutionError(format!("Unexpected error when consuming subquery: {}", e))),
-                                        Ok(elem) => {
-                                            if let Some(elem) = elem {
-                                                let new_env = create_env(&plan, elem.get_original_event())?;
-                                                let mut new_stack = Stack::new();
+                                match stream.try_next().await {
+                                    Err(e) => {
+                                        return Err(ExecutionError(format!(
+                                            "Error when consuming subquery: {}",
+                                            e
+                                        )))
+                                    }
+                                    Ok(elem) => {
+                                        let expr = *expr;
 
-                                                new_stack.push(StackElem::Return);
-                                                new_stack.push(StackElem::Expr(expr.clone()));
-                                                continue;
+                                        if let Some(elem) = elem {
+                                            let mut new_env =
+                                                create_env(&plan, elem.get_original_event())?;
+                                            let pred_expr =
+                                                plan.predicate.as_ref().map(|p| p.clone());
+
+                                            stack.push(StackElem::InSubquery {
+                                                plan,
+                                                negated,
+                                                stream,
+                                            });
+
+                                            stack.push(StackElem::Expr(expr));
+
+                                            if let Some(pred_expr) = pred_expr {
+                                                stack.push(StackElem::Return);
+                                                stack.push(StackElem::Expr(pred_expr));
+
+                                                // We store the previous environment.
+                                                scopes.push(env.clone());
+
+                                                // We create a new environment.
+                                                new_env.extend(env);
+                                                env = new_env;
+                                            } else {
+                                                stack.push(StackElem::Value(SqlValue::Bool(true)));
                                             }
+                                        } else {
+                                            stack.push(StackElem::InSubquery {
+                                                plan,
+                                                negated,
+                                                stream,
+                                            });
 
-                                            break;
+                                            // No need to evaluate the left-side operand because
+                                            // the right side is NULL.
+                                            stack.push(StackElem::Value(SqlValue::Null));
+                                            stack.push(StackElem::Value(SqlValue::Null));
                                         }
+
+                                        continue;
                                     }
                                 }
                             }
@@ -799,7 +871,7 @@ async fn simplify_expr(
                 stack.push(StackElem::Value(result));
             }
 
-            StackElem::InSubquery(_) => unimplemented!(),
+            StackElem::InSubquery { .. } => unimplemented!(),
         }
     }
 }
