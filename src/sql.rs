@@ -178,13 +178,21 @@ pub fn build_plan_from_query(query: Query) -> Option<Plan> {
                 let name = name.0.pop().expect("non empty ident list").value;
                 let alias = alias.map(|a| a.name.value);
 
-               let (join_type, expr) = match join.join_operator {
-                   sqlparser::ast::JoinOperator::Inner(expr) => (JoinType::Inner, join_operator_expr(expr)?),
-                   sqlparser::ast::JoinOperator::LeftOuter(expr) => (JoinType::Left, join_operator_expr(expr)?),
-                   sqlparser::ast::JoinOperator::RightOuter(expr) => (JoinType::Right, join_operator_expr(expr)?),
-                   sqlparser::ast::JoinOperator::FullOuter(expr) => (JoinType::Full, join_operator_expr(expr)?),
-                   _ => return None,
-               };
+                let (join_type, expr) = match join.join_operator {
+                    sqlparser::ast::JoinOperator::Inner(expr) => {
+                        (JoinType::Inner, join_operator_expr(expr)?)
+                    }
+                    sqlparser::ast::JoinOperator::LeftOuter(expr) => {
+                        (JoinType::Left, join_operator_expr(expr)?)
+                    }
+                    sqlparser::ast::JoinOperator::RightOuter(expr) => {
+                        (JoinType::Right, join_operator_expr(expr)?)
+                    }
+                    sqlparser::ast::JoinOperator::FullOuter(expr) => {
+                        (JoinType::Full, join_operator_expr(expr)?)
+                    }
+                    _ => return None,
+                };
 
                 let join = Join {
                     name,
@@ -222,6 +230,23 @@ pub async fn execute_plan<'a>(
         .start_from_beginning()
         .read_through()
         .await?;
+
+    let mut join_streams = Vec::new();
+
+    for join in plan.joins.iter() {
+        let stream = client
+            .read_stream(join.name.as_str())
+            .start_from_beginning()
+            .read_through()
+            .await?;
+
+        if let Some(stream) = stream.ok() {
+            join_streams.push(stream);
+            continue;
+        }
+
+        return Err(ExecutionError(format!("Stream {} doesn't exist", join.name.as_str())).into());
+    }
 
     if let Some(mut stream) = result.ok() {
         let output = async_stream::try_stream! {
