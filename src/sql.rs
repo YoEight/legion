@@ -89,6 +89,26 @@ fn create_env(plan: &Plan, event: &eventstore::RecordedEvent) -> Result<Env, Exe
     }
 }
 
+fn project_env(plan: &Plan, env: &Env) -> serde_json::Value {
+    if plan.fields.len() == 1 {
+        let field = plan.fields.first().unwrap();
+
+        return serde_json::to_value(env.get(field)).unwrap();
+    }
+
+    if plan.fields.is_empty() {
+        return serde_json::to_value(env).unwrap();
+    }
+
+    let mut line = HashMap::new();
+
+    for key in plan.fields.iter() {
+        line.insert(key.clone(), serde_json::to_value(env.get(key)).unwrap());
+    }
+
+    serde_json::to_value(line).unwrap()
+}
+
 pub fn build_plan_from_query(query: Query) -> Option<Plan> {
     let mut plan = Plan::default();
     if let sqlparser::ast::SetExpr::Select(mut select) = query.body {
@@ -153,9 +173,7 @@ pub async fn execute_plan<'a>(
         let output = async_stream::try_stream! {
             while let Ok(Some(event)) = stream.try_next().await {
                 let event = event.get_original_event();
-
-                let mut json_payload = create_env(&plan, event)?;
-                let mut line = HashMap::new();
+                let json_payload = create_env(&plan, event)?;
 
                 if let Some(expr) = plan.predicate.as_ref() {
                     let passed = execute_predicate(client, json_payload.clone(), expr.clone()).await?;
@@ -165,19 +183,7 @@ pub async fn execute_plan<'a>(
                     }
                 }
 
-                if plan.fields.is_empty() {
-                    line = json_payload;
-                } else {
-                    for field in plan.fields.iter() {
-                        if let Some(value) = json_payload.remove(field) {
-                            line.insert(field.clone(), value);
-                        } else {
-                            line.insert(field.clone(), serde_json::Value::Null);
-                        }
-                    }
-                }
-
-                yield serde_json::to_value(line).expect("valid json");
+                yield project_env(&plan, &json_payload);
             }
         };
 
@@ -234,6 +240,16 @@ impl SqlValue {
             (SqlValue::String(_), SqlValue::String(_)) => true,
             (SqlValue::Bool(_), SqlValue::Bool(_)) => true,
             _ => false,
+        }
+    }
+
+    fn as_bool(self) -> Result<bool, ExecutionError> {
+        match self {
+            SqlValue::Bool(b) => Ok(b),
+            other => Err(ExecutionError(format!(
+                "Expecting boolean but got: {:?}",
+                other
+            ))),
         }
     }
 
@@ -327,6 +343,7 @@ enum StackElem {
     InList(bool),
     InSubquery {
         plan: Plan,
+        event: Env,
         negated: bool,
         stream: Box<
             dyn Stream<Item = Result<eventstore::ResolvedEvent, eventstore::Error>> + Send + Unpin,
@@ -347,12 +364,13 @@ impl std::fmt::Debug for StackElem {
             StackElem::InList(ref op) => write!(f, "IsList({:?})", op),
             StackElem::InSubquery {
                 ref plan,
+                ref event,
                 ref negated,
                 ..
             } => write!(
                 f,
-                "InSubquery{{ plan: {:?}, negated: {:?}, *stream* }})",
-                plan, negated
+                "InSubquery{{ plan: {:?}, event: {:?}, negated: {:?}, *stream* }})",
+                plan, event, negated
             ),
             StackElem::Between(ref op) => write!(f, "Between({:?})", op),
             StackElem::Value(ref op) => write!(f, "Value({:?})", op),
@@ -491,7 +509,7 @@ async fn simplify_expr(
                     match stream {
                         Err(e) => {
                             return Err(ExecutionError(format!(
-                                "Error when execution subquery: {}",
+                                "Error during subquery execution: {}",
                                 e
                             )));
                         }
@@ -509,13 +527,14 @@ async fn simplify_expr(
                                         let expr = *expr;
 
                                         if let Some(elem) = elem {
-                                            let mut new_env =
+                                            let mut event =
                                                 create_env(&plan, elem.get_original_event())?;
                                             let pred_expr =
                                                 plan.predicate.as_ref().map(|p| p.clone());
 
                                             stack.push(StackElem::InSubquery {
                                                 plan,
+                                                event: event.clone(),
                                                 negated,
                                                 stream,
                                             });
@@ -530,14 +549,15 @@ async fn simplify_expr(
                                                 scopes.push(env.clone());
 
                                                 // We create a new environment.
-                                                new_env.extend(env);
-                                                env = new_env;
+                                                event.extend(env);
+                                                env = event;
                                             } else {
                                                 stack.push(StackElem::Value(SqlValue::Bool(true)));
                                             }
                                         } else {
                                             stack.push(StackElem::InSubquery {
                                                 plan,
+                                                event: Default::default(),
                                                 negated,
                                                 stream,
                                             });
@@ -871,7 +891,108 @@ async fn simplify_expr(
                 stack.push(StackElem::Value(result));
             }
 
-            StackElem::InSubquery { .. } => unimplemented!(),
+            StackElem::InSubquery {
+                plan,
+                event,
+                negated,
+                mut stream,
+            } => {
+                let expr = params.pop().unwrap();
+                let elem = params.pop().unwrap();
+
+                if expr.is_null() {
+                    stack.push(StackElem::Value(expr));
+
+                    continue;
+                }
+
+                let skip = elem.is_null() || !elem.as_bool()?;
+
+                if !skip {
+                    let field = collect_json_literal(&project_env(&plan, &event))?;
+
+                    if !field.is_null() {
+                        if !expr.is_same_type(&field) {
+                            return Err(ExecutionError(format!(
+                                "Different types used when consuming subquery {:?} and {:?}",
+                                expr, field
+                            )));
+                        }
+
+                        match (&expr, field) {
+                            (SqlValue::Number(ref expr), SqlValue::Number(field))
+                                if *expr == field =>
+                            {
+                                stack.push(StackElem::Value(SqlValue::Bool(!negated)));
+                                continue;
+                            }
+
+                            (SqlValue::Float(ref expr), SqlValue::Float(field)) if *expr == field => {
+                                stack.push(StackElem::Value(SqlValue::Bool(!negated)));
+                                continue;
+                            }
+
+                            (SqlValue::String(ref expr), SqlValue::String(field))
+                                if expr.as_str() == field.as_str() =>
+                            {
+                                stack.push(StackElem::Value(SqlValue::Bool(!negated)));
+                                continue;
+                            }
+
+                            (SqlValue::Bool(ref expr), SqlValue::Bool(field)) if *expr == field => {
+                                stack.push(StackElem::Value(SqlValue::Bool(!negated)));
+                                continue;
+                            }
+
+                            _ => {}
+                        }
+                    }
+                }
+
+                match stream.try_next().await {
+                    Err(e) => {
+                        return Err(ExecutionError(format!(
+                            "Error when consuming subquery: {}",
+                            e
+                        )));
+                    }
+
+                    Ok(elem) => {
+                        if let Some(elem) = elem {
+                            let mut event = create_env(&plan, elem.get_original_event())?;
+                            let pred_expr = plan.predicate.as_ref().map(|p| p.clone());
+
+                            stack.push(StackElem::InSubquery {
+                                plan,
+                                event: event.clone(),
+                                negated,
+                                stream,
+                            });
+
+                            // We push back onto the stack the left-side expression
+                            // we already computed.
+                            stack.push(StackElem::Value(expr));
+
+                            if let Some(pred_expr) = pred_expr {
+                                stack.push(StackElem::Return);
+                                stack.push(StackElem::Expr(pred_expr));
+
+                                // We store the previous environment.
+                                scopes.push(env.clone());
+
+                                // We create a new environment.
+                                event.extend(env);
+                                env = event;
+                            } else {
+                                stack.push(StackElem::Value(SqlValue::Bool(true)));
+                            }
+                            continue;
+                        }
+
+                        stack.push(StackElem::Value(SqlValue::Bool(negated)));
+                    }
+                }
+            }
         }
     }
 }
