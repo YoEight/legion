@@ -1,10 +1,15 @@
+#[macro_use]
+extern crate log;
+
 mod conversion;
 mod history;
 mod input;
 mod lua_impl;
+mod sql;
 
 use crate::conversion::deserialize_repl_value;
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
+use futures::stream::TryStreamExt;
 use input::Input;
 use rlua::Lua;
 use std::io;
@@ -26,13 +31,13 @@ fn parse_connection_string(
 }
 
 static WELCOME: &'static str = "
- | |              (_)            
- | |     ___  __ _ _  ___  _ __  
- | |    / _ \\/ _` | |/ _ \\| '_ \\ 
+ | |              (_)
+ | |     ___  __ _ _  ___  _ __
+ | |    / _ \\/ _` | |/ _ \\| '_ \\
  | |___|  __/ (_| | | (_) | | | |
  |______\\___|\\__, |_|\\___/|_| |_|
-              __/ |              
-             |___/   
+              __/ |
+             |___/
 ";
 
 #[tokio::main]
@@ -46,6 +51,7 @@ async fn main() -> crate::Result<()> {
     println!("{}", WELCOME);
     println!("Version: {}", clap::crate_version!());
 
+    let es_client = client.clone();
     lua.context::<_, rlua::Result<()>>(move |context| {
         let http_client = reqwest::Client::new();
         let inner_client = client.clone();
@@ -189,6 +195,37 @@ async fn main() -> crate::Result<()> {
 
                         Err(e) => {
                             println!("\nERR: {}", e);
+                        }
+                    }
+                }
+
+                crate::input::Command::SqlQuery(stmts) => {
+                    debug!("\n: {:?}", stmts);
+                    let plan = sql::build_plan(stmts);
+                    if let Some(plan) = plan {
+                        let mut stream = sql::execute_plan(&es_client, plan).await?;
+                        println!("\n>>>\n");
+
+                        loop {
+                            match stream.try_next().await {
+                                Ok(line) => {
+                                    if let Some(line) = line {
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&line)
+                                                .expect("valid json")
+                                        );
+                                        continue;
+                                    }
+
+                                    break;
+                                }
+
+                                Err(e) => {
+                                    println!("ERR: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
