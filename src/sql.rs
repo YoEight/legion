@@ -19,7 +19,7 @@ pub struct Plan {
     joins: Vec<Join>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum JoinType {
     Inner,
     Left,
@@ -27,12 +27,27 @@ pub enum JoinType {
     Full,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Join {
     name: String,
     alias: Option<String>,
     join_type: JoinType,
     join_expr: Expr,
+}
+
+impl Join {
+    fn prefix(&self) -> String {
+        let mut prefix = String::new();
+
+        if let Some(alias) = self.alias.as_ref() {
+            prefix.push_str(alias.as_str());
+            prefix.push('.');
+        }
+
+        prefix.push_str(self.name.as_str());
+
+        prefix
+    }
 }
 
 impl Default for Plan {
@@ -59,6 +74,10 @@ pub fn build_plan(mut stmts: Vec<sqlparser::ast::Statement>) -> Option<Plan> {
 }
 
 fn create_env(plan: &Plan, event: &eventstore::RecordedEvent) -> Result<Env, ExecutionError> {
+    create_env_with_alias(plan.alias.as_ref(), event)
+}
+
+fn create_env_with_alias(alias: Option<&String>, event: &eventstore::RecordedEvent) -> Result<Env, ExecutionError> {
     match serde_json::from_slice::<Env>(event.data.as_ref()) {
         Err(e) => Err(ExecutionError(format!(
             "Error when parsing event payload to JSON: {}",
@@ -67,7 +86,7 @@ fn create_env(plan: &Plan, event: &eventstore::RecordedEvent) -> Result<Env, Exe
         Ok(mut env) => {
             let mut prefix = String::new();
 
-            if let Some(alias) = plan.alias.as_ref() {
+            if let Some(alias) = alias {
                 let mut tmp = HashMap::new();
                 for (key, value) in env.drain() {
                     tmp.insert(format!("{}.{}", alias, key), value);
@@ -233,7 +252,7 @@ pub async fn execute_plan<'a>(
 
     let mut join_streams = Vec::new();
 
-    for join in plan.joins.iter() {
+    for join in plan.joins.iter().cloned() {
         let stream = client
             .read_stream(join.name.as_str())
             .start_from_beginning()
@@ -241,7 +260,7 @@ pub async fn execute_plan<'a>(
             .await?;
 
         if let Some(stream) = stream.ok() {
-            join_streams.push(stream);
+            join_streams.push((join, stream));
             continue;
         }
 
@@ -253,6 +272,29 @@ pub async fn execute_plan<'a>(
             while let Ok(Some(event)) = stream.try_next().await {
                 let event = event.get_original_event();
                 let json_payload = create_env(&plan, event)?;
+
+                let mut skipped = false;
+                for (join, join_stream) in join_streams.iter_mut() {
+                    match join_stream.try_next().await {
+                        Err(e) => Err(ExecutionError(format!("Error when consuming stream jointure: {}", e)))?,
+                        Ok(join_elem) => {
+                            if let Some(join_elem) = join_elem {
+                                let prefix = join.prefix();
+
+                                
+                            }
+
+                            if let JoinType::Inner = join.join_type {
+                                skipped = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if skipped {
+                    continue;
+                }
 
                 if let Some(expr) = plan.predicate.as_ref() {
                     let passed = execute_predicate(client, json_payload.clone(), expr.clone()).await?;
