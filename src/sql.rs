@@ -36,12 +36,8 @@ pub struct Join {
 }
 
 impl Join {
-    fn prefix(&self) -> Option<String> {
-        if let Some(alias) = self.alias.as_ref() {
-            return Some(format!("{}.", alias));
-        }
-
-        None
+    fn prefix(&self) -> Option<&String> {
+        self.alias.as_ref()
     }
 }
 
@@ -223,6 +219,7 @@ pub fn build_plan_from_query(query: Query) -> Option<Plan> {
         }
 
         plan.predicate = select.selection;
+        plan.joins = joins;
 
         return Some(plan);
     }
@@ -242,6 +239,8 @@ pub async fn execute_plan<'a>(
     client: &'a eventstore::Client,
     plan: Plan,
 ) -> Result<BoxStream<'a, Result<serde_json::Value, ExecutionError>>, Box<dyn std::error::Error>> {
+    debug!("Build plan: {:?}", plan);
+
     let result = client
         .read_stream(plan.stream_name.as_str())
         .start_from_beginning()
@@ -258,7 +257,13 @@ pub async fn execute_plan<'a>(
             .await?;
 
         if let Some(stream) = stream.ok() {
-            join_streams.push((join, stream));
+            // Because of what joins are, we have to load everything in memory.
+            join_streams.push((
+                join,
+                stream
+                    .try_collect::<Vec<eventstore::ResolvedEvent>>()
+                    .await?,
+            ));
             continue;
         }
 
@@ -273,50 +278,50 @@ pub async fn execute_plan<'a>(
 
                 let mut skipped = false;
                 for (join, join_stream) in join_streams.iter_mut() {
-                    match join_stream.try_next().await {
-                        Err(e) => Err(ExecutionError(format!("Error when consuming stream jointure: {}", e)))?,
-                        Ok(join_elem) => {
-                            if let Some(join_elem) = join_elem {
-                                let prefix = join.prefix();
-                                let join_elem = create_env_with_alias(prefix.as_ref(), join_elem.get_original_event())?;
-                                let mut tmp = json_payload.clone();
+                    let mut line = None;
+                    let mut found = false;
+                    for join_elem in join_stream.iter() {
+                        let prefix = join.prefix();
+                        let join_elem = create_env_with_alias(prefix, join_elem.get_original_event())?;
+                        let mut tmp = json_payload.clone();
 
-                                tmp.extend(join_elem.clone());
+                        tmp.extend(join_elem.clone());
 
-                                let passed = execute_predicate(client, tmp.clone(), join.join_expr.clone()).await?;
+                        let passed = execute_predicate(client, tmp.clone(), join.join_expr.clone()).await?;
 
-                                match join.join_type {
-                                    JoinType::Inner => {
-                                        if passed {
-                                            json_payload = tmp;
-                                        }
+                        line = Some(join_elem);
+                        if passed {
+                            found = true;
+                            break;
+                        }
+                    }
 
-                                        skipped = !passed;
-                                    },
-
-                                    JoinType::Left => {
-                                        if passed {
-                                            json_payload = tmp;
-                                        }
-                                    }
-
-                                    JoinType::Right => {
-                                        if passed {
-                                            json_payload = tmp;
-                                        } else {
-                                            json_payload = join_elem;
-                                        }
-                                    }
-
-                                    JoinType::Full => {
-                                        json_payload = tmp;
-                                    }
-                                }
-                            }
-                            
-                            if skipped {
+                    match join.join_type {
+                        JoinType::Inner => {
+                            if found {
+                                json_payload.extend(line.expect("not empty"));
+                            } else {
+                                skipped = true;
                                 break;
                             }
+                        },
+
+                        JoinType::Left => {
+                            if found {
+                                json_payload.extend(line.expect("not empty"));
+                            }
+                        }
+
+                        JoinType::Right => {
+                            if found {
+                                json_payload.extend(line.expect("not empty"));
+                            } else {
+                                json_payload = line.expect("not empty");
+                            }
+                        }
+
+                        JoinType::Full => {
+                            json_payload.extend(line.expect("not empty"));
                         }
                     }
                 }
