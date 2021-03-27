@@ -36,17 +36,12 @@ pub struct Join {
 }
 
 impl Join {
-    fn prefix(&self) -> String {
-        let mut prefix = String::new();
-
+    fn prefix(&self) -> Option<String> {
         if let Some(alias) = self.alias.as_ref() {
-            prefix.push_str(alias.as_str());
-            prefix.push('.');
+            return Some(format!("{}.", alias));
         }
 
-        prefix.push_str(self.name.as_str());
-
-        prefix
+        None
     }
 }
 
@@ -77,7 +72,10 @@ fn create_env(plan: &Plan, event: &eventstore::RecordedEvent) -> Result<Env, Exe
     create_env_with_alias(plan.alias.as_ref(), event)
 }
 
-fn create_env_with_alias(alias: Option<&String>, event: &eventstore::RecordedEvent) -> Result<Env, ExecutionError> {
+fn create_env_with_alias(
+    alias: Option<&String>,
+    event: &eventstore::RecordedEvent,
+) -> Result<Env, ExecutionError> {
     match serde_json::from_slice::<Env>(event.data.as_ref()) {
         Err(e) => Err(ExecutionError(format!(
             "Error when parsing event payload to JSON: {}",
@@ -271,7 +269,7 @@ pub async fn execute_plan<'a>(
         let output = async_stream::try_stream! {
             while let Ok(Some(event)) = stream.try_next().await {
                 let event = event.get_original_event();
-                let json_payload = create_env(&plan, event)?;
+                let mut json_payload = create_env(&plan, event)?;
 
                 let mut skipped = false;
                 for (join, join_stream) in join_streams.iter_mut() {
@@ -280,12 +278,43 @@ pub async fn execute_plan<'a>(
                         Ok(join_elem) => {
                             if let Some(join_elem) = join_elem {
                                 let prefix = join.prefix();
+                                let join_elem = create_env_with_alias(prefix.as_ref(), join_elem.get_original_event())?;
+                                let mut tmp = json_payload.clone();
 
-                                
+                                tmp.extend(join_elem.clone());
+
+                                let passed = execute_predicate(client, tmp.clone(), join.join_expr.clone()).await?;
+
+                                match join.join_type {
+                                    JoinType::Inner => {
+                                        if passed {
+                                            json_payload = tmp;
+                                        }
+
+                                        skipped = !passed;
+                                    },
+
+                                    JoinType::Left => {
+                                        if passed {
+                                            json_payload = tmp;
+                                        }
+                                    }
+
+                                    JoinType::Right => {
+                                        if passed {
+                                            json_payload = tmp;
+                                        } else {
+                                            json_payload = join_elem;
+                                        }
+                                    }
+
+                                    JoinType::Full => {
+                                        json_payload = tmp;
+                                    }
+                                }
                             }
-
-                            if let JoinType::Inner = join.join_type {
-                                skipped = true;
+                            
+                            if skipped {
                                 break;
                             }
                         }
