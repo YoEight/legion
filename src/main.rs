@@ -2,17 +2,14 @@
 extern crate log;
 
 mod conversion;
-mod history;
-mod input;
 mod lua_impl;
 mod sql;
 
 use crate::conversion::deserialize_repl_value;
 use eventstore::{Client, ClientSettings, ClientSettingsParseError};
 use futures::stream::TryStreamExt;
-use input::Input;
+use glyph::Input;
 use rlua::Lua;
-use std::io;
 use structopt::StructOpt;
 use tokio::task::block_in_place;
 
@@ -44,9 +41,8 @@ static WELCOME: &'static str = "
 async fn main() -> crate::Result<()> {
     pretty_env_logger::init();
     let params = Params::from_args();
-    let mut inputs = crate::input::Inputs::new();
-    let client = Client::create(params.conn_setts.clone()).await?;
-    let mut stdout = io::stdout();
+    let mut inputs = glyph::file_backed_inputs(Default::default(), ".legion")?;
+    let client = Client::new(params.conn_setts.clone())?;
     let lua = Lua::new();
     println!("{}", WELCOME);
     println!("Version: {}", clap::crate_version!());
@@ -147,9 +143,7 @@ async fn main() -> crate::Result<()> {
         Ok(())
     })?;
 
-    loop {
-        let input = block_in_place(|| inputs.await_input(&mut stdout))?;
-
+    while let Some(input) = block_in_place(|| inputs.next_input())? {
         match input {
             Input::Exit => {
                 println!();
@@ -176,9 +170,17 @@ async fn main() -> crate::Result<()> {
                 }
             }
 
-            Input::Command(cmd) => match cmd {
-                crate::input::Command::Load(path) => {
-                    let content = tokio::fs::read(path).await?;
+            Input::Command { name, mut params } => match name.as_str() {
+                "exit" => break,
+                "load" => {
+                    let path = if let Some(p) = params.pop() {
+                        p
+                    } else {
+                        println!("\nERR: a filepath is required");
+                        continue;
+                    };
+
+                    let content = std::fs::read(path)?;
                     match std::str::from_utf8(content.as_slice()) {
                         Ok(source_code) => {
                             let result =
@@ -199,7 +201,18 @@ async fn main() -> crate::Result<()> {
                     }
                 }
 
-                crate::input::Command::SqlQuery(stmts) => {
+                "sql" => {
+                    let query = params.join(" ");
+                    let stmts = match sqlparser::parser::Parser::parse_sql(
+                        &sqlparser::dialect::AnsiDialect {},
+                        query.as_str(),
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            println!("\nERR: {}", e);
+                            continue;
+                        }
+                    };
                     debug!("\n: {:?}", stmts);
                     let plan = sql::build_plan(stmts);
                     if let Some(plan) = plan {
@@ -229,11 +242,9 @@ async fn main() -> crate::Result<()> {
                         }
                     }
                 }
-            },
 
-            Input::Error(e) => {
-                println!("\nERR: {}", e);
-            }
+                unknown => println!("ERR: Unknown command '{}'", unknown),
+            },
         }
     }
 

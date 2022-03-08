@@ -1,19 +1,12 @@
-use core::pin::Pin;
 use futures::stream::BoxStream;
-use futures::{Future, Stream, TryStreamExt};
-use nom::character::complete::{anychar, char, satisfy};
-use nom::combinator::{flat_map, opt, success};
-use nom::multi::fold_many1;
-use nom::{AsChar, IResult, InputIter, Slice};
+use futures::TryStreamExt;
 use sqlparser::ast::{BinaryOperator, Expr, Ident, Query, UnaryOperator};
 use std::collections::HashMap;
-use std::ops::RangeFrom;
 
 #[derive(Debug)]
 pub struct Plan {
     stream_name: String,
     alias: Option<String>,
-    count: usize,
     fields: Vec<String>,
     predicate: Option<Expr>,
     joins: Vec<Join>,
@@ -46,7 +39,6 @@ impl Default for Plan {
         Self {
             stream_name: "".to_string(),
             alias: None,
-            count: usize::MAX,
             fields: Vec::new(),
             predicate: None,
             joins: Vec::new(),
@@ -241,113 +233,101 @@ pub async fn execute_plan<'a>(
 ) -> Result<BoxStream<'a, Result<serde_json::Value, ExecutionError>>, Box<dyn std::error::Error>> {
     debug!("Build plan: {:?}", plan);
 
-    let result = client
-        .read_stream(plan.stream_name.as_str())
-        .start_from_beginning()
-        .read_through()
+    let mut stream = client
+        .read_stream(plan.stream_name.as_str(), &Default::default())
         .await?;
 
     let mut join_streams = Vec::new();
 
     for join in plan.joins.iter().cloned() {
-        let stream = client
-            .read_stream(join.name.as_str())
-            .start_from_beginning()
-            .read_through()
+        let join_stream = client
+            .read_stream(join.name.as_str(), &Default::default())
             .await?;
 
-        if let Some(stream) = stream.ok() {
-            // Because of what joins are, we have to load everything in memory.
-            join_streams.push((
-                join,
-                stream
-                    .try_collect::<Vec<eventstore::ResolvedEvent>>()
-                    .await?,
-            ));
-            continue;
-        }
-
-        return Err(ExecutionError(format!("Stream {} doesn't exist", join.name.as_str())).into());
+        // Because of what joins are, we have to load everything in memory.
+        join_streams.push((
+            join,
+            join_stream
+                .into_stream()
+                .try_collect::<Vec<eventstore::ResolvedEvent>>()
+                .await?,
+        ));
     }
 
-    if let Some(mut stream) = result.ok() {
-        let output = async_stream::try_stream! {
-            while let Ok(Some(event)) = stream.try_next().await {
-                let event = event.get_original_event();
-                let mut json_payload = create_env(&plan, event)?;
+    let output = async_stream::try_stream! {
+        while let Some(event) = stream.next().await? {
+            let event = event.get_original_event();
+            let mut json_payload = create_env(&plan, event)?;
 
-                let mut skipped = false;
-                for (join, join_stream) in join_streams.iter_mut() {
-                    let mut line = None;
-                    let mut found = false;
-                    for join_elem in join_stream.iter() {
-                        let prefix = join.prefix();
-                        let join_elem = create_env_with_alias(prefix, join_elem.get_original_event())?;
-                        let mut tmp = json_payload.clone();
+            let mut skipped = false;
+            for (join, join_stream) in join_streams.iter_mut() {
+                let mut line = None;
+                let mut found = false;
+                for join_elem in join_stream.iter() {
+                    let prefix = join.prefix();
+                    let join_elem = create_env_with_alias(prefix, join_elem.get_original_event())?;
+                    let mut tmp = json_payload.clone();
 
-                        tmp.extend(join_elem.clone());
+                    tmp.extend(join_elem.clone());
 
-                        let passed = execute_predicate(client, tmp.clone(), join.join_expr.clone()).await?;
+                    let passed = execute_predicate(client, tmp.clone(), join.join_expr.clone()).await?;
 
-                        line = Some(join_elem);
-                        if passed {
-                            found = true;
+                    line = Some(join_elem);
+                    if passed {
+                        found = true;
+                        break;
+                    }
+                }
+
+                match join.join_type {
+                    JoinType::Inner => {
+                        if found {
+                            json_payload.extend(line.expect("not empty"));
+                        } else {
+                            skipped = true;
                             break;
                         }
-                    }
+                    },
 
-                    match join.join_type {
-                        JoinType::Inner => {
-                            if found {
-                                json_payload.extend(line.expect("not empty"));
-                            } else {
-                                skipped = true;
-                                break;
-                            }
-                        },
-
-                        JoinType::Left => {
-                            if found {
-                                json_payload.extend(line.expect("not empty"));
-                            }
-                        }
-
-                        JoinType::Right => {
-                            if found {
-                                json_payload.extend(line.expect("not empty"));
-                            } else {
-                                json_payload = line.expect("not empty");
-                            }
-                        }
-
-                        JoinType::Full => {
+                    JoinType::Left => {
+                        if found {
                             json_payload.extend(line.expect("not empty"));
                         }
                     }
-                }
 
-                if skipped {
-                    continue;
-                }
+                    JoinType::Right => {
+                        if found {
+                            json_payload.extend(line.expect("not empty"));
+                        } else {
+                            json_payload = line.expect("not empty");
+                        }
+                    }
 
-                if let Some(expr) = plan.predicate.as_ref() {
-                    let passed = execute_predicate(client, json_payload.clone(), expr.clone()).await?;
-
-                    if !passed {
-                        continue;
+                    JoinType::Full => {
+                        json_payload.extend(line.expect("not empty"));
                     }
                 }
-
-                yield project_env(&plan, &json_payload);
             }
-        };
 
-        let output: BoxStream<'a, Result<serde_json::Value, ExecutionError>> = Box::pin(output);
+            if skipped {
+                continue;
+            }
 
-        return Ok(output);
-    }
+            if let Some(expr) = plan.predicate.as_ref() {
+                let passed = execute_predicate(client, json_payload.clone(), expr.clone()).await?;
 
-    Err(ExecutionError(format!("Stream {} doesn't exist.", plan.stream_name)).into())
+                if !passed {
+                    continue;
+                }
+            }
+
+            yield project_env(&plan, &json_payload);
+        }
+    };
+
+    let output: BoxStream<'a, Result<serde_json::Value, ExecutionError>> = Box::pin(output);
+
+    return Ok(output);
 }
 
 type Env = HashMap<String, serde_json::Value>;
@@ -362,6 +342,12 @@ impl std::fmt::Display for ExecutionError {
 }
 
 impl std::error::Error for ExecutionError {}
+
+impl From<eventstore::Error> for ExecutionError {
+    fn from(e: eventstore::Error) -> Self {
+        ExecutionError(e.to_string())
+    }
+}
 
 #[derive(Debug)]
 enum SqlValue {
@@ -414,47 +400,6 @@ impl SqlValue {
             _ => false,
         }
     }
-
-    fn from_expr(expr: Expr) -> Result<SqlValue, ExecutionError> {
-        if let Expr::Value(value) = expr {
-            return match value {
-                sqlparser::ast::Value::Number(value, is_long) => {
-                    if is_long {
-                        return match value.parse::<i64>() {
-                            Ok(value) => Ok(SqlValue::Number(value)),
-                            Err(e) => Err(ExecutionError(format!(
-                                "Invalid number value format: {}",
-                                e
-                            ))),
-                        };
-                    }
-
-                    match value.parse::<f64>() {
-                        Ok(value) => Ok(SqlValue::Float(value)),
-                        Err(e) => Err(ExecutionError(format!(
-                            "Invalid number value format: {}",
-                            e
-                        ))),
-                    }
-                }
-
-                sqlparser::ast::Value::SingleQuotedString(value) => Ok(SqlValue::String(value)),
-                sqlparser::ast::Value::DoubleQuotedString(value) => Ok(SqlValue::String(value)),
-                sqlparser::ast::Value::Boolean(value) => Ok(SqlValue::Bool(value)),
-                sqlparser::ast::Value::Null => Ok(SqlValue::Null),
-
-                unsupported => Err(ExecutionError(format!(
-                    "Unsuppored SQL literal: {}",
-                    unsupported
-                ))),
-            };
-        }
-
-        Err(ExecutionError(format!(
-            "Expected SQL literal but got: {}",
-            expr
-        )))
-    }
 }
 
 impl std::fmt::Display for SqlValue {
@@ -500,9 +445,7 @@ enum StackElem {
         plan: Plan,
         event: Env,
         negated: bool,
-        stream: Box<
-            dyn Stream<Item = Result<eventstore::ResolvedEvent, eventstore::Error>> + Send + Unpin,
-        >,
+        stream: eventstore::ReadStream,
     },
     Between(bool),
     Value(SqlValue),
@@ -656,9 +599,7 @@ async fn simplify_expr(
                     }?;
 
                     let stream = client
-                        .read_stream(plan.stream_name.as_str())
-                        .start_from_beginning()
-                        .read_through()
+                        .read_stream(plan.stream_name.as_str(), &Default::default())
                         .await;
 
                     match stream {
@@ -669,69 +610,61 @@ async fn simplify_expr(
                             )));
                         }
 
-                        Ok(stream) => {
-                            if let Some(mut stream) = stream.ok() {
-                                match stream.try_next().await {
-                                    Err(e) => {
-                                        return Err(ExecutionError(format!(
-                                            "Error when consuming subquery: {}",
-                                            e
-                                        )))
-                                    }
-                                    Ok(elem) => {
-                                        let expr = *expr;
+                        Ok(mut stream) => {
+                            match stream.next().await {
+                                Err(e) => {
+                                    return Err(ExecutionError(format!(
+                                        "Error when consuming subquery: {:?}",
+                                        e
+                                    )))
+                                }
+                                Ok(elem) => {
+                                    let expr = *expr;
 
-                                        if let Some(elem) = elem {
-                                            let mut event =
-                                                create_env(&plan, elem.get_original_event())?;
-                                            let pred_expr =
-                                                plan.predicate.as_ref().map(|p| p.clone());
+                                    if let Some(elem) = elem {
+                                        let mut event =
+                                            create_env(&plan, elem.get_original_event())?;
+                                        let pred_expr = plan.predicate.as_ref().map(|p| p.clone());
 
-                                            stack.push(StackElem::InSubquery {
-                                                plan,
-                                                event: event.clone(),
-                                                negated,
-                                                stream,
-                                            });
+                                        stack.push(StackElem::InSubquery {
+                                            plan,
+                                            event: event.clone(),
+                                            negated,
+                                            stream,
+                                        });
 
-                                            stack.push(StackElem::Expr(expr));
+                                        stack.push(StackElem::Expr(expr));
 
-                                            if let Some(pred_expr) = pred_expr {
-                                                stack.push(StackElem::Return);
-                                                stack.push(StackElem::Expr(pred_expr));
+                                        if let Some(pred_expr) = pred_expr {
+                                            stack.push(StackElem::Return);
+                                            stack.push(StackElem::Expr(pred_expr));
 
-                                                // We store the previous environment.
-                                                scopes.push(env.clone());
+                                            // We store the previous environment.
+                                            scopes.push(env.clone());
 
-                                                // We create a new environment.
-                                                event.extend(env);
-                                                env = event;
-                                            } else {
-                                                stack.push(StackElem::Value(SqlValue::Bool(true)));
-                                            }
+                                            // We create a new environment.
+                                            event.extend(env);
+                                            env = event;
                                         } else {
-                                            stack.push(StackElem::InSubquery {
-                                                plan,
-                                                event: Default::default(),
-                                                negated,
-                                                stream,
-                                            });
-
-                                            // No need to evaluate the left-side operand because
-                                            // the right side is NULL.
-                                            stack.push(StackElem::Value(SqlValue::Null));
-                                            stack.push(StackElem::Value(SqlValue::Null));
+                                            stack.push(StackElem::Value(SqlValue::Bool(true)));
                                         }
+                                    } else {
+                                        stack.push(StackElem::InSubquery {
+                                            plan,
+                                            event: Default::default(),
+                                            negated,
+                                            stream,
+                                        });
 
-                                        continue;
+                                        // No need to evaluate the left-side operand because
+                                        // the right side is NULL.
+                                        stack.push(StackElem::Value(SqlValue::Null));
+                                        stack.push(StackElem::Value(SqlValue::Null));
                                     }
+
+                                    continue;
                                 }
                             }
-
-                            return Err(ExecutionError(format!(
-                                "stream mentioned in subquery doesn't not exist: {}",
-                                plan.stream_name.as_str()
-                            )));
                         }
                     }
                 }
@@ -1106,10 +1039,10 @@ async fn simplify_expr(
                     }
                 }
 
-                match stream.try_next().await {
+                match stream.next().await {
                     Err(e) => {
                         return Err(ExecutionError(format!(
-                            "Error when consuming subquery: {}",
+                            "Error when consuming subquery: {:?}",
                             e
                         )));
                     }
